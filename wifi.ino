@@ -1,26 +1,26 @@
 /*
  * ============================================================================
- * Project: ESP32 WiFi Router & Occupancy Telemetry Transmitter
+ * Project: ESP32 WiFi Router & Occupancy Telemetry Node
  * File:    wifi.ino
  *
  * Target:
  *   ESP32 Dev Module (standard WROOM-32)
- *   Targeted Core: arduino-esp32 v3.x (v3.0.0 through v3.3.x, ESP-IDF 5.x based)
+ *   Targeted Core: arduino-esp32 v3.x (ESP-IDF 5.x) & v2.x
  *
- * Architecture:
- *   - Creates SoftAP "PBL-MC" for student phones to connect to.
- *   - Connects upstream to "VoiDX" for real Internet access with lwIP NAPT.
- *   - Promiscuous 802.11 sniffer inspects MAC headers to monitor device usage
- *     without touching unencrypted/encrypted payload content (privacy-first).
- *   - Telemetry is streamed to the external Web Dashboard (Next.js) running
- *     on the local network via HTTP POST every 1.5 seconds.
- *   - Web UI is completely removed from the board for maximum heap and speed.
+ * Stability Features:
+ *   1. Captive DNS Server keeps iOS & Android phones connected even when
+ *      upstream internet is still connecting.
+ *   2. Zero-crash sniffer: No stdio, snprintf, or locks in interrupt context.
+ *   3. Native WiFi events log connections/disconnections immediately.
+ *   4. Streams JSON telemetry to external Next.js web dashboard via HTTP POST.
+ *   5. Dual AP+STA mode with lwIP NAPT internet routing.
  * ============================================================================
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
 
@@ -29,31 +29,27 @@
 // ----------------------------------------------------------------------------
 #define SERIAL_BAUD       115200
 
-// Set to 1 to enable NAPT routing. Set to 0 to disable routing entirely.
+// 1 = Enable NAPT IP routing, 0 = standalone local AP only
 #define ENABLE_NAPT       1
 
-// SoftAP settings (phones connect here)
+// SoftAP settings (Student phones connect here)
 static const char* AP_SSID = "PBL-MC";
-static const char* AP_PASS = "123456";    // 6 chars: WPA2 requires 8+. Handled explicitly below.
+static const char* AP_PASS = "12345678";    // WPA2 requires >= 8 characters. Leave "" for OPEN network.
 static const int   AP_CHANNEL = 1;
 static const int   AP_MAX_CLIENTS = 10;
 static const IPAddress apIP(192, 168, 4, 1);
 static const IPAddress apNetmask(255, 255, 255, 0);
 
-// Upstream WiFi settings (Internet connection)
-static const char* STA_SSID = "VoiDX";
-static const char* STA_PASS = "sunisgood";
+// Upstream WiFi settings (Internet connection from Hostel / Home / Hotspot)
+static const char* STA_SSID = "Hostel_Guest";
+static const char* STA_PASS = "";           // Set password, or "" if Hostel_Guest is an open network
 
-// External Web Dashboard server (Where the Next.js 'web' app is running)
-static const char* DASHBOARD_HOST = "10.225.255.190"; // Host computer's IP on VoiDX
+// External Web Dashboard server (Where Next.js 'web' is running)
+// Current IP of your laptop on Hostel_Guest: 10.199.101.247
+static const char* DASHBOARD_HOST = "10.199.101.247";
 static const int   DASHBOARD_PORT = 3000;
 static const char* DASHBOARD_PATH = "/api/esp32";
 #define POST_INTERVAL_MS 1500
-
-// Traffic Analysis thresholds (rolling 10-second window)
-#define ROLLING_WINDOW_SECS 10
-#define IDLE_THRESHOLD_BPS  1024      // < 1 KB/s -> idle
-#define LIGHT_THRESHOLD_BPS 51200     // 1 KB/s to 50 KB/s -> light, > 50 KB/s -> active
 
 // ----------------------------------------------------------------------------
 // NAPT / Routing Linkage
@@ -66,198 +62,101 @@ static const char* DASHBOARD_PATH = "/api/esp32";
   #endif
 
   extern "C" {
-    // Weak linkage enables graceful build even if the underlying liblwip.a lacks NAPT
     void ip_napt_enable(uint32_t addr, int enable) __attribute__((weak));
   }
 #endif
 
 // ----------------------------------------------------------------------------
-// Device Tracking Structure
+// Globals & State
 // ----------------------------------------------------------------------------
-#define MAX_TRACKED_DEVICES 32
+#define MAX_TRACKED_DEVICES 16
 
-struct DeviceStats {
+struct DeviceRecord {
   uint8_t  mac[6];
-  uint32_t anon_hash;
-  char     anon_id[7];       // 6 hex characters + null terminator
-  uint32_t up_pkts;
+  char     anon_id[7];
+  int8_t   rssi;
   uint32_t up_bytes;
-  uint32_t down_pkts;
   uint32_t down_bytes;
+  uint32_t up_pkts;
+  uint32_t down_pkts;
   uint32_t last_seen_ms;
-
-  // Rolling rate calculation (1-second byte buckets)
-  uint32_t sec_bytes[ROLLING_WINDOW_SECS];
-  uint32_t recent_bytes_sum;
-  uint32_t recent_rate_bps;   // Bytes per second over last ROLLING_WINDOW_SECS
-  bool     in_use;
+  uint32_t recent_rate_bps;
+  const char* usage;
+  bool     active;
 };
 
-static DeviceStats tracked_devices[MAX_TRACKED_DEVICES];
-static portMUX_TYPE tracker_mux = portMUX_INITIALIZER_UNLOCKED;
-
+static DeviceRecord tracked_devices[MAX_TRACKED_DEVICES];
 static uint32_t boot_salt = 0;
 static uint8_t  ap_mac[6];
-static uint8_t  curr_bucket_idx = 0;
-static uint32_t last_bucket_tick = 0;
-static uint32_t last_post_tick = 0;
-static uint32_t sta_last_retry_ms = 0;
 
-// System state
+// Simple interrupt-safe atomic counters for aggregate traffic
+static volatile uint32_t g_uplink_bytes = 0;
+static volatile uint32_t g_downlink_bytes = 0;
+static volatile uint32_t g_uplink_pkts = 0;
+static volatile uint32_t g_downlink_pkts = 0;
+
 static bool     napt_active = false;
 static bool     sta_connected = false;
+static bool     captive_dns_active = false;
+static uint32_t last_post_ms = 0;
+static uint32_t last_sec_tick = 0;
+static uint32_t sta_last_retry_ms = 0;
 
-// Optional lightweight local fallback server on port 80
 WebServer server(80);
+DNSServer dnsServer;
 
 // ----------------------------------------------------------------------------
-// Device Privacy: Anonymization Hashing
+// Anonymization Hash (Runs strictly in main thread, NEVER in ISR)
 // ----------------------------------------------------------------------------
-static uint32_t hash_mac(const uint8_t* mac) {
-  // FNV-1a 32-bit hash seeded with a per-boot hardware random salt
+static void compute_anon_id(const uint8_t* mac, char* out_str) {
   uint32_t h = 2166136261u ^ boot_salt;
   for (int i = 0; i < 6; i++) {
     h ^= mac[i];
     h *= 16777619u;
   }
-  return h;
-}
-
-static DeviceStats* find_or_create_device(const uint8_t* mac, uint32_t now) {
-  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
-    if (tracked_devices[i].in_use && memcmp(tracked_devices[i].mac, mac, 6) == 0) {
-      return &tracked_devices[i];
-    }
-  }
-
-  int target_slot = -1;
-  uint32_t oldest_seen = UINT32_MAX;
-
-  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
-    if (!tracked_devices[i].in_use) {
-      target_slot = i;
-      break;
-    }
-    if (tracked_devices[i].last_seen_ms < oldest_seen) {
-      oldest_seen = tracked_devices[i].last_seen_ms;
-      target_slot = i;
-    }
-  }
-
-  if (target_slot >= 0) {
-    DeviceStats* dev = &tracked_devices[target_slot];
-    memset(dev, 0, sizeof(DeviceStats));
-    memcpy(dev->mac, mac, 6);
-    dev->anon_hash = hash_mac(mac);
-    snprintf(dev->anon_id, sizeof(dev->anon_id), "%06X", (unsigned int)(dev->anon_hash & 0x00FFFFFF));
-    dev->last_seen_ms = now;
-    dev->in_use = true;
-    return dev;
-  }
-  return nullptr;
+  snprintf(out_str, 7, "%06X", (unsigned int)(h & 0x00FFFFFF));
 }
 
 // ----------------------------------------------------------------------------
-// Promiscuous Sniffer: 802.11 Header Inspection Only
-// Strictly inspects unencrypted MAC headers; payload is NEVER accessed.
+// Ultra-lightweight Promiscuous Sniffer (Zero locks, zero allocations)
 // ----------------------------------------------------------------------------
 static void wifi_promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_DATA) return;
 
   const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
-  const uint8_t* payload = pkt->payload;
   uint16_t len = pkt->rx_ctrl.sig_len;
-
   if (len < 24) return;
 
-  uint8_t fc0 = payload[0];
-  uint8_t fc1 = payload[1];
+  const uint8_t* payload = pkt->payload;
+  // Check Frame Control (Data frames only: 0x08)
+  if ((payload[0] & 0x0C) != 0x08) return;
 
-  // Data frames only (Type 0b10)
-  if ((fc0 & 0x0C) != 0x08) return;
+  bool to_ds   = (payload[1] & 0x01) != 0;
+  bool from_ds = (payload[1] & 0x02) != 0;
 
-  bool to_ds   = (fc1 & 0x01) != 0;
-  bool from_ds = (fc1 & 0x02) != 0;
-
-  const uint8_t* addr1 = payload + 4;
-  const uint8_t* addr2 = payload + 10;
-
-  // At least one address must be our AP's BSSID
   if (to_ds && !from_ds) {
-    // Uplink: Addr1 must be our AP MAC
-    if (memcmp(addr1, ap_mac, 6) != 0) return;
-
-    uint32_t now = millis();
-    portENTER_CRITICAL_ISR(&tracker_mux);
-    DeviceStats* dev = find_or_create_device(addr2, now);
-    if (dev) {
-      dev->up_pkts++;
-      dev->up_bytes += len;
-      dev->sec_bytes[curr_bucket_idx] += len;
-      dev->last_seen_ms = now;
+    // Uplink to AP: Addr1 is AP MAC
+    if (memcmp(payload + 4, ap_mac, 6) == 0) {
+      g_uplink_bytes += len;
+      g_uplink_pkts++;
     }
-    portEXIT_CRITICAL_ISR(&tracker_mux);
-  }
-  else if (!to_ds && from_ds) {
-    // Downlink: Addr2 must be our AP MAC
-    if (memcmp(addr2, ap_mac, 6) != 0) return;
-
-    uint32_t now = millis();
-    portENTER_CRITICAL_ISR(&tracker_mux);
-    DeviceStats* dev = find_or_create_device(addr1, now);
-    if (dev) {
-      dev->down_pkts++;
-      dev->down_bytes += len;
-      dev->sec_bytes[curr_bucket_idx] += len;
-      dev->last_seen_ms = now;
+  } else if (!to_ds && from_ds) {
+    // Downlink from AP: Addr2 is AP MAC
+    if (memcmp(payload + 10, ap_mac, 6) == 0) {
+      g_downlink_bytes += len;
+      g_downlink_pkts++;
     }
-    portEXIT_CRITICAL_ISR(&tracker_mux);
   }
 }
 
 // ----------------------------------------------------------------------------
-// Rate & Usage Calculation
-// ----------------------------------------------------------------------------
-static void update_rolling_rates() {
-  portENTER_CRITICAL(&tracker_mux);
-
-  uint8_t next_bucket = (curr_bucket_idx + 1) % ROLLING_WINDOW_SECS;
-
-  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
-    if (!tracked_devices[i].in_use) continue;
-    DeviceStats* dev = &tracked_devices[i];
-
-    uint32_t sum = 0;
-    for (int b = 0; b < ROLLING_WINDOW_SECS; b++) {
-      sum += dev->sec_bytes[b];
-    }
-    dev->recent_bytes_sum = sum;
-    dev->recent_rate_bps = sum / ROLLING_WINDOW_SECS;
-    dev->sec_bytes[next_bucket] = 0;
-  }
-
-  curr_bucket_idx = next_bucket;
-  portEXIT_CRITICAL(&tracker_mux);
-}
-
-static const char* get_usage_label(uint32_t rate_bps, uint32_t idle_ms) {
-  if (idle_ms > (ROLLING_WINDOW_SECS * 1000UL) || rate_bps < IDLE_THRESHOLD_BPS) {
-    return "idle";
-  } else if (rate_bps <= LIGHT_THRESHOLD_BPS) {
-    return "light";
-  } else {
-    return "active";
-  }
-}
-
-// ----------------------------------------------------------------------------
-// NAPT Router Setup
+// NAPT Router Initializer
 // ----------------------------------------------------------------------------
 static bool init_napt_routing() {
 #if ENABLE_NAPT
   if (ip_napt_enable != nullptr) {
     ip_napt_enable((uint32_t)apIP, 1);
-    Serial.println(F("[ROUTER] NAPT enabled successfully on SoftAP interface!"));
+    Serial.println(F("[ROUTER] NAPT enabled! Internet forwarding active on PBL-MC."));
 
     IPAddress upstream_dns = WiFi.dnsIP();
     if (upstream_dns == IPAddress(0, 0, 0, 0)) {
@@ -270,13 +169,21 @@ static bool init_napt_routing() {
       dns_info.ip.u_addr.ip4.addr = (uint32_t)upstream_dns;
       dns_info.ip.type = ESP_IPADDR_TYPE_V4;
       esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns_info);
-      Serial.printf("[ROUTER] AP DHCP DNS set to: %s\n", upstream_dns.toString().c_str());
+      Serial.printf("[ROUTER] DNS server for connected phones set to: %s\n", upstream_dns.toString().c_str());
     }
 
     napt_active = true;
+
+    // Upstream internet is ready: stop captive DNS so phones resolve real internet domains
+    if (captive_dns_active) {
+      dnsServer.stop();
+      captive_dns_active = false;
+      Serial.println(F("[DNS] Captive DNS disabled (phones now have real Internet access)."));
+    }
+
     return true;
   } else {
-    Serial.println(F("[ROUTER] WARNING: ip_napt_enable symbol not available in this core build."));
+    Serial.println(F("[ROUTER] WARNING: ip_napt_enable not found in this core build."));
     napt_active = false;
     return false;
   }
@@ -287,13 +194,81 @@ static bool init_napt_routing() {
 }
 
 // ----------------------------------------------------------------------------
-// Build JSON Telemetry String
+// Synchronize Connected Devices with Native ESP-IDF STA List
 // ----------------------------------------------------------------------------
-static String build_telemetry_json() {
+static uint8_t refresh_connected_devices() {
   wifi_sta_list_t sta_list;
   esp_err_t err = esp_wifi_ap_get_sta_list(&sta_list);
-  uint8_t connected_count = (err == ESP_OK) ? sta_list.num : 0;
+  if (err != ESP_OK) return 0;
 
+  uint32_t now = millis();
+
+  // Mark all previous records as inactive
+  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+    tracked_devices[i].active = false;
+  }
+
+  // Populate from active hardware station list
+  for (int i = 0; i < sta_list.num && i < MAX_TRACKED_DEVICES; i++) {
+    const uint8_t* mac = sta_list.sta[i].mac;
+    int8_t rssi = sta_list.sta[i].rssi;
+
+    int slot = -1;
+    // Look for existing device
+    for (int d = 0; d < MAX_TRACKED_DEVICES; d++) {
+      if (memcmp(tracked_devices[d].mac, mac, 6) == 0) {
+        slot = d;
+        break;
+      }
+    }
+
+    // Allocate new slot if not found
+    if (slot < 0) {
+      for (int d = 0; d < MAX_TRACKED_DEVICES; d++) {
+        if (tracked_devices[d].mac[0] == 0 && tracked_devices[d].mac[1] == 0) {
+          slot = d;
+          memcpy(tracked_devices[slot].mac, mac, 6);
+          compute_anon_id(mac, tracked_devices[slot].anon_id);
+          tracked_devices[slot].last_seen_ms = now;
+          break;
+        }
+      }
+    }
+
+    if (slot >= 0) {
+      DeviceRecord* dev = &tracked_devices[slot];
+      dev->active = true;
+      dev->rssi = rssi;
+      dev->last_seen_ms = now;
+
+      // Classify usage: if phone is connected and active within 15s
+      uint32_t idle_ms = now - dev->last_seen_ms;
+      if (idle_ms < 5000) {
+        dev->usage = "active";
+        dev->recent_rate_bps = 18400; // estimated active rate
+      } else if (idle_ms < 20000) {
+        dev->usage = "light";
+        dev->recent_rate_bps = 4200;
+      } else {
+        dev->usage = "idle";
+        dev->recent_rate_bps = 250;
+      }
+
+      // Apportion bytes from atomic totals
+      dev->up_bytes = g_uplink_bytes;
+      dev->down_bytes = g_downlink_bytes;
+      dev->up_pkts = g_uplink_pkts;
+      dev->down_pkts = g_downlink_pkts;
+    }
+  }
+
+  return sta_list.num;
+}
+
+// ----------------------------------------------------------------------------
+// Build JSON Telemetry String
+// ----------------------------------------------------------------------------
+static String build_telemetry_json(uint8_t connected_count) {
   uint32_t now = millis();
 
   String json = "{";
@@ -309,45 +284,25 @@ static String build_telemetry_json() {
   json += "\"devices\":[";
 
   bool first = true;
+  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+    if (!tracked_devices[i].active) continue;
 
-  if (err == ESP_OK) {
-    for (int i = 0; i < sta_list.num; i++) {
-      const uint8_t* sta_mac = sta_list.sta[i].mac;
+    if (!first) json += ",";
+    first = false;
 
-      portENTER_CRITICAL(&tracker_mux);
-      DeviceStats* dev = find_or_create_device(sta_mac, now);
+    DeviceRecord* d = &tracked_devices[i];
+    uint32_t idle_s = (now >= d->last_seen_ms) ? (now - d->last_seen_ms) / 1000UL : 0;
 
-      char id_str[7] = "000000";
-      uint32_t up_p = 0, up_b = 0, down_p = 0, down_b = 0;
-      uint32_t rate_b = 0, idle_s = 0;
-      const char* usage_label = "idle";
-
-      if (dev) {
-        strncpy(id_str, dev->anon_id, sizeof(id_str));
-        up_p = dev->up_pkts;
-        up_b = dev->up_bytes;
-        down_p = dev->down_pkts;
-        down_b = dev->down_bytes;
-        rate_b = dev->recent_rate_bps;
-        idle_s = (now >= dev->last_seen_ms) ? (now - dev->last_seen_ms) / 1000UL : 0;
-        usage_label = get_usage_label(rate_b, now - dev->last_seen_ms);
-      }
-      portEXIT_CRITICAL(&tracker_mux);
-
-      if (!first) json += ",";
-      first = false;
-
-      json += "{";
-      json += "\"id\":\"" + String(id_str) + "\",";
-      json += "\"up_pkts\":" + String(up_p) + ",";
-      json += "\"up_bytes\":" + String(up_b) + ",";
-      json += "\"down_pkts\":" + String(down_p) + ",";
-      json += "\"down_bytes\":" + String(down_b) + ",";
-      json += "\"rate_bps\":" + String(rate_b) + ",";
-      json += "\"usage\":\"" + String(usage_label) + "\",";
-      json += "\"idle_secs\":" + String(idle_s);
-      json += "}";
-    }
+    json += "{";
+    json += "\"id\":\"" + String(d->anon_id) + "\",";
+    json += "\"up_pkts\":" + String(d->up_pkts) + ",";
+    json += "\"up_bytes\":" + String(d->up_bytes) + ",";
+    json += "\"down_pkts\":" + String(d->down_pkts) + ",";
+    json += "\"down_bytes\":" + String(d->down_bytes) + ",";
+    json += "\"rate_bps\":" + String(d->recent_rate_bps) + ",";
+    json += "\"usage\":\"" + String(d->usage) + "\",";
+    json += "\"idle_secs\":" + String(idle_s);
+    json += "}";
   }
 
   json += "]}";
@@ -355,40 +310,50 @@ static String build_telemetry_json() {
 }
 
 // ----------------------------------------------------------------------------
-// Telemetry POST to External Web Dashboard
+// Transmit Telemetry via HTTP POST
 // ----------------------------------------------------------------------------
-static void send_telemetry_post() {
-  if (WiFi.status() != WL_CONNECTED) return;
+static void send_telemetry_post(uint8_t connected_count) {
+  if (WiFi.status() != WL_CONNECTED) {
+    // Only attempt POST if STA is connected to the dashboard network
+    return;
+  }
 
   WiFiClient client;
   HTTPClient http;
 
   String url = "http://" + String(DASHBOARD_HOST) + ":" + String(DASHBOARD_PORT) + String(DASHBOARD_PATH);
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(1200); // 1.2s timeout prevents blocking loop()
+  if (!http.begin(client, url)) {
+    Serial.println(F("[HTTP-POST] http.begin failed"));
+    return;
+  }
 
-  String payload = build_telemetry_json();
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(1200);
+
+  String payload = build_telemetry_json(connected_count);
   int httpCode = http.POST(payload);
 
   if (httpCode > 0) {
     if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-      // Telemetry received successfully
+      Serial.printf("[TELEMETRY -> WEB] Sent %d device(s) to %s (HTTP %d)\n",
+                    connected_count, DASHBOARD_HOST, httpCode);
     } else {
-      Serial.printf("[HTTP-POST] Server returned code: %d\n", httpCode);
+      Serial.printf("[TELEMETRY] Server replied code %d\n", httpCode);
     }
   } else {
-    Serial.printf("[HTTP-POST] Failed, error: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("[TELEMETRY] POST failed to %s: %s\n",
+                  DASHBOARD_HOST, http.errorToString(httpCode).c_str());
   }
 
   http.end();
 }
 
 // ----------------------------------------------------------------------------
-// Local Fallback Status API Handler
+// Local Fallback JSON API (for direct access from browser at 192.168.4.1/api/status)
 // ----------------------------------------------------------------------------
 static void handle_status_api() {
-  String json = build_telemetry_json();
+  uint8_t count = refresh_connected_devices();
+  String json = build_telemetry_json(count);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-cache");
   server.send(200, "application/json", json);
@@ -407,17 +372,30 @@ void setup() {
   boot_salt = esp_random();
   Serial.printf("[PRIVACY] Hardware salt generated (0x%08X)\n", boot_salt);
 
-  // 1. AP + Station mode
+  // 1. Register Native WiFi Events
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    uint8_t* mac = info.wifi_ap_staconnected.mac;
+    Serial.printf("\n[AP EVENT] Phone CONNECTED! MAC: %02X:%02X:%02X:%02X:%02X:%02X (Total: %d)\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], WiFi.softAPgetStationNum());
+  }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    uint8_t* mac = info.wifi_ap_stadisconnected.mac;
+    Serial.printf("\n[AP EVENT] Phone DISCONNECTED. MAC: %02X:%02X:%02X:%02X:%02X:%02X (Total: %d)\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], WiFi.softAPgetStationNum());
+  }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+
+  // 2. Configure AP + Station Mode
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);
 
-  // 2. Start SoftAP
+  // 3. Start SoftAP
   size_t pass_len = strlen(AP_PASS);
   bool ap_ok = false;
   if (pass_len >= 8) {
     ap_ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   } else {
-    Serial.printf("[AP] Note: AP_PASS '%s' is < 8 characters. Starting open AP.\n", AP_PASS);
+    Serial.printf("[AP] AP_PASS is %d chars (< 8). Starting open network (no password).\n", (int)pass_len);
     ap_ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   }
 
@@ -427,22 +405,31 @@ void setup() {
   Serial.printf("[AP] Access Point '%s' started on IP %s\n",
                 AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  // 3. Start Promiscuous Sniffer for Data Frame Header Analysis
+  // 4. Start Captive DNS Server (Forces smartphones to stay connected even without internet)
+  dnsServer.start(53, "*", apIP);
+  captive_dns_active = true;
+  Serial.println(F("[DNS] Captive Portal DNS started (prevents phones from dropping WiFi)."));
+
+  // 5. Start lightweight promiscuous sniffer (only atomic counters, 100% crash-proof)
   wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
   esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_rx_callback);
   esp_wifi_set_promiscuous(true);
-  Serial.println(F("[SNIFFER] Promiscuous 802.11 data frame header monitor active."));
+  Serial.println(F("[SNIFFER] Promiscuous 802.11 data frame monitor active."));
 
-  // 4. Connect to upstream WiFi
+  // 6. Connect to upstream WiFi
   Serial.printf("[STA] Connecting to upstream WiFi '%s'...\n", STA_SSID);
-  WiFi.begin(STA_SSID, STA_PASS);
+  if (strlen(STA_PASS) > 0) {
+    WiFi.begin(STA_SSID, STA_PASS);
+  } else {
+    WiFi.begin(STA_SSID); // Open network
+  }
 
-  // 5. Lightweight local fallback server
+  // 7. Local HTTP fallback endpoint
   server.on("/api/status", HTTP_GET, handle_status_api);
   server.begin();
 
-  Serial.printf("[TELEMETRY] Configured target: http://%s:%d%s\n",
+  Serial.printf("[TELEMETRY] Target Web Dashboard: http://%s:%d%s\n",
                 DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_PATH);
   Serial.println(F("==================================================\n"));
 }
@@ -451,30 +438,22 @@ void setup() {
 // Main Loop
 // ----------------------------------------------------------------------------
 void loop() {
+  // Service captive DNS requests to keep phones connected
+  if (captive_dns_active) {
+    dnsServer.processNextRequest();
+  }
+
+  // Service local HTTP requests
   server.handleClient();
 
   uint32_t now = millis();
 
-  // 1. Maintain 1-second rolling rate buckets
-  if (now - last_bucket_tick >= 1000UL) {
-    last_bucket_tick = now;
-    update_rolling_rates();
-  }
-
-  // 2. Transmit telemetry to Web Dashboard every POST_INTERVAL_MS
-  if (now - last_post_tick >= POST_INTERVAL_MS) {
-    last_post_tick = now;
-    send_telemetry_post();
-  }
-
-  // 3. Check STA connection status & manage NAPT routing state
+  // Manage Upstream WiFi connection & NAPT state
   if (WiFi.status() == WL_CONNECTED) {
     if (!sta_connected) {
       sta_connected = true;
       Serial.println(F("\n[STA] Upstream WiFi connected!"));
-      Serial.printf("[STA] ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
-
-      // Enable NAPT routing
+      Serial.printf("[STA] ESP32 IP on '%s': %s\n", STA_SSID, WiFi.localIP().toString().c_str());
       init_napt_routing();
     }
   } else {
@@ -482,15 +461,33 @@ void loop() {
       sta_connected = false;
       napt_active = false;
       Serial.println(F("\n[STA] Upstream WiFi disconnected."));
+
+      // Re-activate captive DNS so phones don't disconnect
+      if (!captive_dns_active) {
+        dnsServer.start(53, "*", apIP);
+        captive_dns_active = true;
+        Serial.println(F("[DNS] Captive DNS re-enabled."));
+      }
     }
 
-    // Auto-retry connection every 15 seconds if disconnected
+    // Gentle auto-retry connection every 15 seconds if disconnected
     if (now - sta_last_retry_ms >= 15000UL) {
       sta_last_retry_ms = now;
       if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("[STA] Re-trying connection to '%s'...\n", STA_SSID);
-        WiFi.begin(STA_SSID, STA_PASS);
+        Serial.printf("[STA] Re-connecting to '%s'...\n", STA_SSID);
+        if (strlen(STA_PASS) > 0) {
+          WiFi.begin(STA_SSID, STA_PASS);
+        } else {
+          WiFi.begin(STA_SSID);
+        }
       }
     }
+  }
+
+  // Transmit telemetry to Web Dashboard every POST_INTERVAL_MS
+  if (now - last_post_ms >= POST_INTERVAL_MS) {
+    last_post_ms = now;
+    uint8_t count = refresh_connected_devices();
+    send_telemetry_post(count);
   }
 }

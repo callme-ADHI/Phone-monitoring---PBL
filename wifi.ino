@@ -19,6 +19,7 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
 
@@ -33,6 +34,7 @@
 // SoftAP settings (phones connect here)
 static const char* AP_SSID = "PBL-MC";
 static const char* AP_PASS = "123456";    // 6 chars: WPA2 requires 8+. Handled explicitly below.
+static const int   AP_CHANNEL = 1;
 static const int   AP_MAX_CLIENTS = 10;
 static const IPAddress apIP(192, 168, 4, 1);
 static const IPAddress apNetmask(255, 255, 255, 0);
@@ -95,9 +97,11 @@ static uint32_t last_bucket_tick = 0;
 // System state
 static bool     napt_active = false;
 static bool     sta_connected = false;
+static bool     captive_portal_active = false;
 static uint32_t sta_last_retry_ms = 0;
 
 WebServer server(80);
+DNSServer dnsServer;
 
 // ----------------------------------------------------------------------------
 // Device Privacy: Anonymization Hashing
@@ -113,14 +117,12 @@ static uint32_t hash_mac(const uint8_t* mac) {
 }
 
 static DeviceStats* find_or_create_device(const uint8_t* mac, uint32_t now) {
-  // Check if device already tracked
   for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
     if (tracked_devices[i].in_use && memcmp(tracked_devices[i].mac, mac, 6) == 0) {
       return &tracked_devices[i];
     }
   }
 
-  // Allocate new slot or overwrite oldest
   int target_slot = -1;
   uint32_t oldest_seen = UINT32_MAX;
 
@@ -151,6 +153,7 @@ static DeviceStats* find_or_create_device(const uint8_t* mac, uint32_t now) {
 // ----------------------------------------------------------------------------
 // Promiscuous Sniffer: 802.11 Header Inspection Only
 // Strictly inspects unencrypted MAC headers; payload is NEVER accessed.
+// Ultra-fast path: immediately drops packets not destined to/from our AP.
 // ----------------------------------------------------------------------------
 static void wifi_promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_DATA) return;
@@ -159,51 +162,50 @@ static void wifi_promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t 
   const uint8_t* payload = pkt->payload;
   uint16_t len = pkt->rx_ctrl.sig_len;
 
-  if (len < 24) return; // Minimum 802.11 MAC header length
+  if (len < 24) return;
 
   uint8_t fc0 = payload[0];
   uint8_t fc1 = payload[1];
 
-  // Verify Frame Type is Data (0b10 in bits 2..3)
+  // Data frames only (Type 0b10)
   if ((fc0 & 0x0C) != 0x08) return;
 
   bool to_ds   = (fc1 & 0x01) != 0;
   bool from_ds = (fc1 & 0x02) != 0;
 
-  const uint8_t* addr1 = payload + 4;   // Receiver Address
-  const uint8_t* addr2 = payload + 10;  // Transmitter Address
+  const uint8_t* addr1 = payload + 4;
+  const uint8_t* addr2 = payload + 10;
 
-  uint32_t now = millis();
-
-  // Uplink: Phone -> ESP32 SoftAP (ToDS = 1, FromDS = 0)
-  // Addr1 is BSSID (our AP MAC), Addr2 is Phone MAC
+  // Ultra-fast early drop: at least one address must be our AP's BSSID
   if (to_ds && !from_ds) {
-    if (memcmp(addr1, ap_mac, 6) == 0) {
-      portENTER_CRITICAL_ISR(&tracker_mux);
-      DeviceStats* dev = find_or_create_device(addr2, now);
-      if (dev) {
-        dev->up_pkts++;
-        dev->up_bytes += len;
-        dev->sec_bytes[curr_bucket_idx] += len;
-        dev->last_seen_ms = now;
-      }
-      portEXIT_CRITICAL_ISR(&tracker_mux);
+    // Uplink: Addr1 must be our AP MAC
+    if (memcmp(addr1, ap_mac, 6) != 0) return;
+
+    uint32_t now = millis();
+    portENTER_CRITICAL_ISR(&tracker_mux);
+    DeviceStats* dev = find_or_create_device(addr2, now);
+    if (dev) {
+      dev->up_pkts++;
+      dev->up_bytes += len;
+      dev->sec_bytes[curr_bucket_idx] += len;
+      dev->last_seen_ms = now;
     }
+    portEXIT_CRITICAL_ISR(&tracker_mux);
   }
-  // Downlink: ESP32 SoftAP -> Phone (ToDS = 0, FromDS = 1)
-  // Addr1 is Phone MAC, Addr2 is BSSID (our AP MAC)
   else if (!to_ds && from_ds) {
-    if (memcmp(addr2, ap_mac, 6) == 0) {
-      portENTER_CRITICAL_ISR(&tracker_mux);
-      DeviceStats* dev = find_or_create_device(addr1, now);
-      if (dev) {
-        dev->down_pkts++;
-        dev->down_bytes += len;
-        dev->sec_bytes[curr_bucket_idx] += len;
-        dev->last_seen_ms = now;
-      }
-      portEXIT_CRITICAL_ISR(&tracker_mux);
+    // Downlink: Addr2 must be our AP MAC
+    if (memcmp(addr2, ap_mac, 6) != 0) return;
+
+    uint32_t now = millis();
+    portENTER_CRITICAL_ISR(&tracker_mux);
+    DeviceStats* dev = find_or_create_device(addr1, now);
+    if (dev) {
+      dev->down_pkts++;
+      dev->down_bytes += len;
+      dev->sec_bytes[curr_bucket_idx] += len;
+      dev->last_seen_ms = now;
     }
+    portEXIT_CRITICAL_ISR(&tracker_mux);
   }
 }
 
@@ -214,22 +216,18 @@ static void update_rolling_rates() {
   uint32_t now = millis();
   portENTER_CRITICAL(&tracker_mux);
 
-  // Advance circular bucket index
   uint8_t next_bucket = (curr_bucket_idx + 1) % ROLLING_WINDOW_SECS;
 
   for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
     if (!tracked_devices[i].in_use) continue;
     DeviceStats* dev = &tracked_devices[i];
 
-    // Tally sum over all buckets in window
     uint32_t sum = 0;
     for (int b = 0; b < ROLLING_WINDOW_SECS; b++) {
       sum += dev->sec_bytes[b];
     }
     dev->recent_bytes_sum = sum;
     dev->recent_rate_bps = sum / ROLLING_WINDOW_SECS;
-
-    // Reset the upcoming bucket for new second's samples
     dev->sec_bytes[next_bucket] = 0;
   }
 
@@ -253,14 +251,12 @@ static const char* get_usage_label(uint32_t rate_bps, uint32_t idle_ms) {
 static bool init_napt_routing() {
 #if ENABLE_NAPT
   if (ip_napt_enable != nullptr) {
-    // Enable NAPT on SoftAP interface address
     ip_napt_enable((uint32_t)apIP, 1);
     Serial.println(F("[ROUTER] NAPT enabled successfully on SoftAP interface!"));
 
-    // Configure DNS server offered by SoftAP DHCP server
     IPAddress upstream_dns = WiFi.dnsIP();
     if (upstream_dns == IPAddress(0, 0, 0, 0)) {
-      upstream_dns = IPAddress(8, 8, 8, 8); // Google public DNS fallback
+      upstream_dns = IPAddress(8, 8, 8, 8);
     }
 
     esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -273,6 +269,14 @@ static bool init_napt_routing() {
     }
 
     napt_active = true;
+
+    // Internet is working: disable captive DNS redirection so clients can resolve real domains
+    if (captive_portal_active) {
+      dnsServer.stop();
+      captive_portal_active = false;
+      Serial.println(F("[DNS] Captive DNS disabled (Internet routing active)."));
+    }
+
     return true;
   } else {
     Serial.println(F("[ROUTER] WARNING: ip_napt_enable symbol not available in this core build."));
@@ -532,10 +536,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
 
-        // Update counts & status
         document.getElementById('dev-count').innerText = data.connected_count;
-        
-        // Routing status
+
         const rb = document.getElementById('routing-badge');
         if (data.routing_status === 'active') {
           rb.innerHTML = '<span class="status-pill pill-active">Active</span>';
@@ -545,7 +547,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
           document.getElementById('routing-sub').innerText = 'Local AP only (no NAT)';
         }
 
-        // Upstream STA status
         const sb = document.getElementById('sta-badge');
         const stext = document.getElementById('sta-ip-text');
         if (data.sta_status === 'connected') {
@@ -556,16 +557,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
           stext.innerText = 'Retrying ' + data.sta_ssid;
         }
 
-        // Channel and Uptime
         document.getElementById('ch-uptime').innerText = 'Ch ' + data.channel;
         document.getElementById('uptime-text').innerText = 'Uptime: ' + fmtUptime(data.uptime_secs);
 
-        // Header IP details
         document.getElementById('net-info').innerText =
           'AP: ' + data.ap_ssid + ' (' + data.ap_ip + ') • Upstream: ' + data.sta_ssid +
           (data.sta_status === 'connected' ? ' (' + data.sta_ip + ')' : ' (disconnected)');
 
-        // Render device rows
         const tbody = document.getElementById('device-rows');
         if (!data.devices || data.devices.length === 0) {
           tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No devices currently connected to PBL-MC</td></tr>';
@@ -596,7 +594,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
-    // Poll every 1.5 seconds
     setInterval(pollStatus, 1500);
     pollStatus();
   </script>
@@ -608,18 +605,22 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 // Web Server Request Handlers
 // ----------------------------------------------------------------------------
 static void handle_root() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
+static void handle_captive_redirect() {
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "Redirecting to router dashboard...");
+}
+
 static void handle_status_api() {
-  // Query authoritative station list from ESP32 WiFi driver
   wifi_sta_list_t sta_list;
   esp_err_t err = esp_wifi_ap_get_sta_list(&sta_list);
   uint8_t connected_count = (err == ESP_OK) ? sta_list.num : 0;
 
   uint32_t now = millis();
 
-  // Build JSON response
   String json = "{";
   json += "\"connected_count\":" + String(connected_count) + ",";
   json += "\"routing_status\":\"" + String(napt_active ? "active" : "unavailable") + "\",";
@@ -677,6 +678,7 @@ static void handle_status_api() {
   json += "]}";
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-cache");
   server.send(200, "application/json", json);
 }
 
@@ -690,18 +692,16 @@ void setup() {
   Serial.println(F("    ESP32 WiFi Router & Occupancy Monitor         "));
   Serial.println(F("=================================================="));
 
-  // Generate per-boot hardware random salt for MAC anonymization
   boot_salt = esp_random();
   Serial.printf("[PRIVACY] Hardware salt generated (0x%08X)\n", boot_salt);
 
-  // 1. Set dual AP + Station mode
+  // 1. Set combined AP + Station mode
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(true);
 
-  // 2. Configure AP static IP
-  WiFi.softAPConfig(apIP, apIP, apNetmask);
-
-  // 3. AP Password Length Handling (WPA2 requires min 8 characters)
+  // 2. Start SoftAP
   size_t pass_len = strlen(AP_PASS);
+  bool ap_ok = false;
   if (pass_len > 0 && pass_len < 8) {
     Serial.println(F("\n[WARNING] ----------------------------------------------------"));
     Serial.printf("[WARNING] Configured AP password '%s' is only %d characters!\n", AP_PASS, (int)pass_len);
@@ -710,33 +710,57 @@ void setup() {
     Serial.println(F("[WARNING] Change AP_PASS to 8+ characters to secure this network."));
     Serial.println(F("[WARNING] ----------------------------------------------------\n"));
 
-    WiFi.softAP(AP_SSID, nullptr, 1, 0, AP_MAX_CLIENTS);
+    ap_ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   } else if (pass_len >= 8) {
-    WiFi.softAP(AP_SSID, AP_PASS, 1, 0, AP_MAX_CLIENTS);
+    ap_ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   } else {
-    WiFi.softAP(AP_SSID, nullptr, 1, 0, AP_MAX_CLIENTS);
+    ap_ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   }
 
+  // Ensure standard IP and subnet are set
+  WiFi.softAPConfig(apIP, apIP, apNetmask);
   WiFi.softAPmacAddress(ap_mac);
-  Serial.printf("[AP] Access Point started: SSID='%s' IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  // 4. Start Promiscuous Sniffer for Traffic Header Analysis
+  Serial.printf("[AP] Access Point started: SSID='%s' IP=%s Status=%s\n",
+                AP_SSID, WiFi.softAPIP().toString().c_str(), ap_ok ? "OK" : "FAILED");
+
+  // 3. Start Captive DNS Server (Handles mobile captive detection so phones don't switch to cellular)
+  dnsServer.start(53, "*", apIP);
+  captive_portal_active = true;
+  Serial.println(F("[DNS] Captive Portal DNS responder started on port 53."));
+
+  // 4. Start Promiscuous Sniffer for Data Frame Header Analysis
   wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
   esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_rx_callback);
   esp_wifi_set_promiscuous(true);
   Serial.println(F("[SNIFFER] Promiscuous 802.11 data frame header monitor active."));
 
-  // 5. Connect to upstream WiFi (Non-blocking: initiates background connection)
+  // 5. Connect to upstream WiFi
   Serial.printf("[STA] Connecting to upstream WiFi '%s'...\n", STA_SSID);
   WiFi.begin(STA_SSID, STA_PASS);
 
-  // 6. Start Web Server
+  // 6. Web Server Endpoints
   server.on("/", HTTP_GET, handle_root);
   server.on("/api/status", HTTP_GET, handle_status_api);
+
+  // Captive portal probes from iOS, Android, and Windows
+  server.on("/generate_204", handle_root);
+  server.on("/hotspot-detect.html", handle_root);
+  server.on("/canonical.html", handle_root);
+  server.on("/connecttest.txt", handle_root);
+  server.on("/ncsi.txt", handle_root);
+
+  // Catch-all: redirect any unknown request to the dashboard
+  server.onNotFound(handle_captive_redirect);
+
   server.begin();
   Serial.println(F("[HTTP] Web dashboard server started on port 80."));
-  Serial.printf("[HTTP] Access from phone on PBL-MC: http://%s/\n", WiFi.softAPIP().toString().c_str());
+  Serial.println(F("--------------------------------------------------"));
+  Serial.println(F("HOW TO ACCESS THE DASHBOARD:"));
+  Serial.println(F("1. Connect your phone or laptop to WiFi: PBL-MC"));
+  Serial.println(F("2. Open your browser and go to: http://192.168.4.1/"));
+  Serial.println(F("   (Make sure to use http:// and NOT https://)"));
   Serial.println(F("==================================================\n"));
 }
 
@@ -744,6 +768,12 @@ void setup() {
 // Main Loop
 // ----------------------------------------------------------------------------
 void loop() {
+  // Service DNS requests for captive portal
+  if (captive_portal_active) {
+    dnsServer.processNextRequest();
+  }
+
+  // Service HTTP clients
   server.handleClient();
 
   uint32_t now = millis();
@@ -762,21 +792,30 @@ void loop() {
       Serial.printf("[STA] ESP32 IP on '%s': %s\n", STA_SSID, WiFi.localIP().toString().c_str());
       Serial.printf("[STA] Channel in use: %d\n", WiFi.channel());
 
-      // Attempt to enable NAPT routing
+      // Enable NAPT routing
       init_napt_routing();
     }
   } else {
     if (sta_connected) {
       sta_connected = false;
       napt_active = false;
-      Serial.println(F("\n[STA] Upstream WiFi disconnected. Routing unavailable."));
+      Serial.println(F("\n[STA] Upstream WiFi disconnected."));
+
+      // Re-enable captive DNS so clients can access 192.168.4.1 without internet
+      if (!captive_portal_active) {
+        dnsServer.start(53, "*", apIP);
+        captive_portal_active = true;
+        Serial.println(F("[DNS] Captive DNS re-enabled."));
+      }
     }
 
-    // Auto-retry connection every 10 seconds without blocking the loop
-    if (now - sta_last_retry_ms >= 10000UL) {
+    // Gentle auto-retry connection every 15 seconds if disconnected
+    if (now - sta_last_retry_ms >= 15000UL) {
       sta_last_retry_ms = now;
-      Serial.printf("[STA] Retrying connection to '%s'...\n", STA_SSID);
-      WiFi.begin(STA_SSID, STA_PASS);
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[STA] Checking connection to '%s'...\n", STA_SSID);
+        WiFi.begin(STA_SSID, STA_PASS);
+      }
     }
   }
 }

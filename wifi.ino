@@ -1,25 +1,26 @@
 /*
  * ============================================================================
- * Project: ESP32 WiFi Router & Classroom Occupancy Monitor
+ * Project: ESP32 WiFi Router & Occupancy Telemetry Transmitter
  * File:    wifi.ino
  *
  * Target:
  *   ESP32 Dev Module (standard WROOM-32)
  *   Targeted Core: arduino-esp32 v3.x (v3.0.0 through v3.3.x, ESP-IDF 5.x based)
  *
- * Core Version & NAPT Notes:
- *   - In arduino-esp32 v3.x, lwIP NAPT functions (ip_napt_enable) are compiled
- *     directly into the prebuilt liblwip.a library.
- *   - In older arduino-esp32 v2.0.x cores, NAPT was omitted from standard
- *     precompiled libraries; if compiled on a core lacking NAPT symbols, the
- *     weak symbol linkage prevents linker crashes and allows graceful degradation
- *     (device counting, traffic monitoring, and web interface remain 100% operational).
+ * Architecture:
+ *   - Creates SoftAP "PBL-MC" for student phones to connect to.
+ *   - Connects upstream to "VoiDX" for real Internet access with lwIP NAPT.
+ *   - Promiscuous 802.11 sniffer inspects MAC headers to monitor device usage
+ *     without touching unencrypted/encrypted payload content (privacy-first).
+ *   - Telemetry is streamed to the external Web Dashboard (Next.js) running
+ *     on the local network via HTTP POST every 1.5 seconds.
+ *   - Web UI is completely removed from the board for maximum heap and speed.
  * ============================================================================
  */
 
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
-#include <DNSServer.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
 
@@ -42,6 +43,12 @@ static const IPAddress apNetmask(255, 255, 255, 0);
 // Upstream WiFi settings (Internet connection)
 static const char* STA_SSID = "VoiDX";
 static const char* STA_PASS = "sunisgood";
+
+// External Web Dashboard server (Where the Next.js 'web' app is running)
+static const char* DASHBOARD_HOST = "10.225.255.190"; // Host computer's IP on VoiDX
+static const int   DASHBOARD_PORT = 3000;
+static const char* DASHBOARD_PATH = "/api/esp32";
+#define POST_INTERVAL_MS 1500
 
 // Traffic Analysis thresholds (rolling 10-second window)
 #define ROLLING_WINDOW_SECS 10
@@ -93,15 +100,15 @@ static uint32_t boot_salt = 0;
 static uint8_t  ap_mac[6];
 static uint8_t  curr_bucket_idx = 0;
 static uint32_t last_bucket_tick = 0;
+static uint32_t last_post_tick = 0;
+static uint32_t sta_last_retry_ms = 0;
 
 // System state
 static bool     napt_active = false;
 static bool     sta_connected = false;
-static bool     captive_portal_active = false;
-static uint32_t sta_last_retry_ms = 0;
 
+// Optional lightweight local fallback server on port 80
 WebServer server(80);
-DNSServer dnsServer;
 
 // ----------------------------------------------------------------------------
 // Device Privacy: Anonymization Hashing
@@ -153,7 +160,6 @@ static DeviceStats* find_or_create_device(const uint8_t* mac, uint32_t now) {
 // ----------------------------------------------------------------------------
 // Promiscuous Sniffer: 802.11 Header Inspection Only
 // Strictly inspects unencrypted MAC headers; payload is NEVER accessed.
-// Ultra-fast path: immediately drops packets not destined to/from our AP.
 // ----------------------------------------------------------------------------
 static void wifi_promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_DATA) return;
@@ -176,7 +182,7 @@ static void wifi_promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t 
   const uint8_t* addr1 = payload + 4;
   const uint8_t* addr2 = payload + 10;
 
-  // Ultra-fast early drop: at least one address must be our AP's BSSID
+  // At least one address must be our AP's BSSID
   if (to_ds && !from_ds) {
     // Uplink: Addr1 must be our AP MAC
     if (memcmp(addr1, ap_mac, 6) != 0) return;
@@ -210,10 +216,9 @@ static void wifi_promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t 
 }
 
 // ----------------------------------------------------------------------------
-// Rate & Usage Calculation (Called once per second from loop)
+// Rate & Usage Calculation
 // ----------------------------------------------------------------------------
 static void update_rolling_rates() {
-  uint32_t now = millis();
   portENTER_CRITICAL(&tracker_mux);
 
   uint8_t next_bucket = (curr_bucket_idx + 1) % ROLLING_WINDOW_SECS;
@@ -269,352 +274,22 @@ static bool init_napt_routing() {
     }
 
     napt_active = true;
-
-    // Internet is working: disable captive DNS redirection so clients can resolve real domains
-    if (captive_portal_active) {
-      dnsServer.stop();
-      captive_portal_active = false;
-      Serial.println(F("[DNS] Captive DNS disabled (Internet routing active)."));
-    }
-
     return true;
   } else {
     Serial.println(F("[ROUTER] WARNING: ip_napt_enable symbol not available in this core build."));
-    Serial.println(F("[ROUTER] Internet routing: UNAVAILABLE (operating in standalone AP mode)."));
     napt_active = false;
     return false;
   }
 #else
-  Serial.println(F("[ROUTER] NAPT disabled by ENABLE_NAPT setting."));
   napt_active = false;
   return false;
 #endif
 }
 
 // ----------------------------------------------------------------------------
-// Embedded Web Dashboard (HTML / CSS / JavaScript)
-// 100% self-contained in PROGMEM; zero external CDN dependencies.
+// Build JSON Telemetry String
 // ----------------------------------------------------------------------------
-static const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ESP32 WiFi Router & Monitor</title>
-  <style>
-    :root {
-      --bg: #0b0f19;
-      --card-bg: rgba(22, 31, 48, 0.7);
-      --border: rgba(255, 255, 255, 0.08);
-      --text: #f3f4f6;
-      --text-muted: #9ca3af;
-      --accent: #38bdf8;
-      --green: #10b981;
-      --amber: #f59e0b;
-      --orange: #f97316;
-      --red: #ef4444;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      padding: 1.5rem;
-    }
-    .container { max-width: 960px; margin: 0 auto; }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 2rem;
-      flex-wrap: wrap;
-      gap: 1rem;
-    }
-    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
-    .subtitle { color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem; }
-    .live-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      background: rgba(16, 185, 129, 0.1);
-      border: 1px solid rgba(16, 185, 129, 0.3);
-      color: var(--green);
-      font-size: 0.75rem;
-      font-weight: 600;
-      padding: 0.35rem 0.75rem;
-      border-radius: 9999px;
-    }
-    .pulse-dot {
-      width: 8px;
-      height: 8px;
-      background: var(--green);
-      border-radius: 50%;
-      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
-      animation: pulse 1.8s infinite;
-    }
-    @keyframes pulse {
-      0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-      70% { box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); }
-      100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-      gap: 1rem;
-      margin-bottom: 2rem;
-    }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 1.25rem;
-      backdrop-filter: blur(12px);
-    }
-    .card-label {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-bottom: 0.5rem;
-    }
-    .card-value { font-size: 1.75rem; font-weight: 700; }
-    .card-subtext { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.35rem; }
-    .status-pill {
-      display: inline-block;
-      padding: 0.2rem 0.55rem;
-      border-radius: 6px;
-      font-size: 0.75rem;
-      font-weight: 600;
-    }
-    .pill-active { background: rgba(16, 185, 129, 0.15); color: var(--green); }
-    .pill-unavailable { background: rgba(239, 68, 68, 0.15); color: var(--red); }
-    .pill-connecting { background: rgba(245, 158, 11, 0.15); color: var(--amber); }
-
-    .table-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      overflow: hidden;
-      margin-bottom: 1.5rem;
-    }
-    .table-header {
-      padding: 1rem 1.25rem;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .table-title { font-weight: 600; font-size: 1rem; }
-    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem; }
-    th {
-      background: rgba(0, 0, 0, 0.2);
-      color: var(--text-muted);
-      font-weight: 600;
-      padding: 0.75rem 1.25rem;
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    td { padding: 0.85rem 1.25rem; border-bottom: 1px solid var(--border); }
-    tr:last-child td { border-bottom: none; }
-    .anon-id {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-weight: 700;
-      color: var(--accent);
-      background: rgba(56, 189, 248, 0.1);
-      padding: 0.2rem 0.45rem;
-      border-radius: 4px;
-      letter-spacing: 0.05em;
-    }
-    .badge-idle { background: rgba(156, 163, 175, 0.15); color: var(--text-muted); }
-    .badge-light { background: rgba(56, 189, 248, 0.15); color: var(--accent); }
-    .badge-active { background: rgba(249, 115, 22, 0.15); color: var(--orange); }
-    .empty-state {
-      padding: 2.5rem;
-      text-align: center;
-      color: var(--text-muted);
-      font-size: 0.9rem;
-    }
-    footer {
-      text-align: center;
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      margin-top: 2rem;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div>
-        <h1>ESP32 WiFi Router & Occupancy</h1>
-        <div class="subtitle" id="net-info">AP: PBL-MC (192.168.4.1) &bull; Upstream: VoiDX</div>
-      </div>
-      <div class="live-badge">
-        <div class="pulse-dot"></div>
-        <span id="update-indicator">Live Polling</span>
-      </div>
-    </header>
-
-    <div class="grid">
-      <div class="card">
-        <div class="card-label">Connected Devices</div>
-        <div class="card-value" id="dev-count">0</div>
-        <div class="card-subtext">Stations on PBL-MC</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Internet Routing (NAT)</div>
-        <div class="card-value" id="routing-badge">
-          <span class="status-pill pill-connecting">Checking...</span>
-        </div>
-        <div class="card-subtext" id="routing-sub">lwIP NAPT Status</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Upstream Connection</div>
-        <div class="card-value" id="sta-badge">
-          <span class="status-pill pill-connecting">Connecting...</span>
-        </div>
-        <div class="card-subtext" id="sta-ip-text">SSID: VoiDX</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Channel & Uptime</div>
-        <div class="card-value" id="ch-uptime">Ch --</div>
-        <div class="card-subtext" id="uptime-text">Uptime: 0s</div>
-      </div>
-    </div>
-
-    <div class="table-card">
-      <div class="table-header">
-        <div class="table-title">Currently Connected Devices</div>
-        <div class="card-subtext">Hashed Anonymous IDs &bull; No payload stored</div>
-      </div>
-      <div id="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Device ID</th>
-              <th>Uplink (Tx)</th>
-              <th>Downlink (Rx)</th>
-              <th>Recent Rate</th>
-              <th>Activity State</th>
-              <th>Last Active</th>
-            </tr>
-          </thead>
-          <tbody id="device-rows">
-            <tr><td colspan="6" class="empty-state">No devices currently connected to PBL-MC</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <footer>
-      ESP32 Local Router &bull; Hardware: ESP32-WROOM-32 &bull; Privacy-Preserving Monitoring
-    </footer>
-  </div>
-
-  <script>
-    function fmtBytes(bytes) {
-      if (bytes < 1024) return bytes + ' B';
-      if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-      return (bytes / 1048576).toFixed(2) + ' MB';
-    }
-
-    function fmtUptime(sec) {
-      const h = Math.floor(sec / 3600);
-      const m = Math.floor((sec % 3600) / 60);
-      const s = sec % 60;
-      if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
-      if (m > 0) return m + 'm ' + s + 's';
-      return s + 's';
-    }
-
-    async function pollStatus() {
-      try {
-        const res = await fetch('/api/status');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-
-        document.getElementById('dev-count').innerText = data.connected_count;
-
-        const rb = document.getElementById('routing-badge');
-        if (data.routing_status === 'active') {
-          rb.innerHTML = '<span class="status-pill pill-active">Active</span>';
-          document.getElementById('routing-sub').innerText = 'Forwarding traffic to internet';
-        } else {
-          rb.innerHTML = '<span class="status-pill pill-unavailable">Unavailable</span>';
-          document.getElementById('routing-sub').innerText = 'Local AP only (no NAT)';
-        }
-
-        const sb = document.getElementById('sta-badge');
-        const stext = document.getElementById('sta-ip-text');
-        if (data.sta_status === 'connected') {
-          sb.innerHTML = '<span class="status-pill pill-active">Connected</span>';
-          stext.innerText = 'IP: ' + data.sta_ip;
-        } else {
-          sb.innerHTML = '<span class="status-pill pill-connecting">Connecting...</span>';
-          stext.innerText = 'Retrying ' + data.sta_ssid;
-        }
-
-        document.getElementById('ch-uptime').innerText = 'Ch ' + data.channel;
-        document.getElementById('uptime-text').innerText = 'Uptime: ' + fmtUptime(data.uptime_secs);
-
-        document.getElementById('net-info').innerText =
-          'AP: ' + data.ap_ssid + ' (' + data.ap_ip + ') • Upstream: ' + data.sta_ssid +
-          (data.sta_status === 'connected' ? ' (' + data.sta_ip + ')' : ' (disconnected)');
-
-        const tbody = document.getElementById('device-rows');
-        if (!data.devices || data.devices.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No devices currently connected to PBL-MC</td></tr>';
-        } else {
-          let rows = '';
-          data.devices.forEach(d => {
-            let badgeClass = 'badge-idle';
-            if (d.usage === 'light') badgeClass = 'badge-light';
-            if (d.usage === 'active') badgeClass = 'badge-active';
-
-            rows += '<tr>' +
-              '<td><span class="anon-id">DEV-' + d.id + '</span></td>' +
-              '<td>' + d.up_pkts.toLocaleString() + ' <span style="color:var(--text-muted);font-size:0.75rem;">(' + fmtBytes(d.up_bytes) + ')</span></td>' +
-              '<td>' + d.down_pkts.toLocaleString() + ' <span style="color:var(--text-muted);font-size:0.75rem;">(' + fmtBytes(d.down_bytes) + ')</span></td>' +
-              '<td>' + (d.rate_bps / 1024).toFixed(1) + ' KB/s</td>' +
-              '<td><span class="status-pill ' + badgeClass + '">' + d.usage.toUpperCase() + '</span></td>' +
-              '<td>' + d.idle_secs + 's ago</td>' +
-            '</tr>';
-          });
-          tbody.innerHTML = rows;
-        }
-
-        document.getElementById('update-indicator').innerText = 'Live Polling';
-        document.getElementById('update-indicator').style.color = 'var(--green)';
-      } catch (err) {
-        document.getElementById('update-indicator').innerText = 'Reconnecting...';
-        document.getElementById('update-indicator').style.color = 'var(--amber)';
-      }
-    }
-
-    setInterval(pollStatus, 1500);
-    pollStatus();
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// ----------------------------------------------------------------------------
-// Web Server Request Handlers
-// ----------------------------------------------------------------------------
-static void handle_root() {
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
-static void handle_captive_redirect() {
-  server.sendHeader("Location", "http://192.168.4.1/", true);
-  server.send(302, "text/plain", "Redirecting to router dashboard...");
-}
-
-static void handle_status_api() {
+static String build_telemetry_json() {
   wifi_sta_list_t sta_list;
   esp_err_t err = esp_wifi_ap_get_sta_list(&sta_list);
   uint8_t connected_count = (err == ESP_OK) ? sta_list.num : 0;
@@ -676,7 +351,44 @@ static void handle_status_api() {
   }
 
   json += "]}";
+  return json;
+}
 
+// ----------------------------------------------------------------------------
+// Telemetry POST to External Web Dashboard
+// ----------------------------------------------------------------------------
+static void send_telemetry_post() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url = "http://" + String(DASHBOARD_HOST) + ":" + String(DASHBOARD_PORT) + String(DASHBOARD_PATH);
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(1200); // 1.2s timeout prevents blocking loop()
+
+  String payload = build_telemetry_json();
+  int httpCode = http.POST(payload);
+
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+      // Telemetry received successfully
+    } else {
+      Serial.printf("[HTTP-POST] Server returned code: %d\n", httpCode);
+    }
+  } else {
+    Serial.printf("[HTTP-POST] Failed, error: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+}
+
+// ----------------------------------------------------------------------------
+// Local Fallback Status API Handler
+// ----------------------------------------------------------------------------
+static void handle_status_api() {
+  String json = build_telemetry_json();
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-cache");
   server.send(200, "application/json", json);
@@ -689,78 +401,49 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(1000);
   Serial.println(F("\n=================================================="));
-  Serial.println(F("    ESP32 WiFi Router & Occupancy Monitor         "));
+  Serial.println(F("  ESP32 WiFi Router & Occupancy Telemetry Node   "));
   Serial.println(F("=================================================="));
 
   boot_salt = esp_random();
   Serial.printf("[PRIVACY] Hardware salt generated (0x%08X)\n", boot_salt);
 
-  // 1. Set combined AP + Station mode
+  // 1. AP + Station mode
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);
 
   // 2. Start SoftAP
   size_t pass_len = strlen(AP_PASS);
   bool ap_ok = false;
-  if (pass_len > 0 && pass_len < 8) {
-    Serial.println(F("\n[WARNING] ----------------------------------------------------"));
-    Serial.printf("[WARNING] Configured AP password '%s' is only %d characters!\n", AP_PASS, (int)pass_len);
-    Serial.println(F("[WARNING] WPA2 specification requires a minimum of 8 characters."));
-    Serial.println(F("[WARNING] Starting 'PBL-MC' as an OPEN network (no password)."));
-    Serial.println(F("[WARNING] Change AP_PASS to 8+ characters to secure this network."));
-    Serial.println(F("[WARNING] ----------------------------------------------------\n"));
-
-    ap_ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, 0, AP_MAX_CLIENTS);
-  } else if (pass_len >= 8) {
+  if (pass_len >= 8) {
     ap_ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   } else {
+    Serial.printf("[AP] Note: AP_PASS '%s' is < 8 characters. Starting open AP.\n", AP_PASS);
     ap_ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   }
 
-  // Ensure standard IP and subnet are set
   WiFi.softAPConfig(apIP, apIP, apNetmask);
   WiFi.softAPmacAddress(ap_mac);
 
-  Serial.printf("[AP] Access Point started: SSID='%s' IP=%s Status=%s\n",
-                AP_SSID, WiFi.softAPIP().toString().c_str(), ap_ok ? "OK" : "FAILED");
+  Serial.printf("[AP] Access Point '%s' started on IP %s\n",
+                AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  // 3. Start Captive DNS Server (Handles mobile captive detection so phones don't switch to cellular)
-  dnsServer.start(53, "*", apIP);
-  captive_portal_active = true;
-  Serial.println(F("[DNS] Captive Portal DNS responder started on port 53."));
-
-  // 4. Start Promiscuous Sniffer for Data Frame Header Analysis
+  // 3. Start Promiscuous Sniffer for Data Frame Header Analysis
   wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
   esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_rx_callback);
   esp_wifi_set_promiscuous(true);
   Serial.println(F("[SNIFFER] Promiscuous 802.11 data frame header monitor active."));
 
-  // 5. Connect to upstream WiFi
+  // 4. Connect to upstream WiFi
   Serial.printf("[STA] Connecting to upstream WiFi '%s'...\n", STA_SSID);
   WiFi.begin(STA_SSID, STA_PASS);
 
-  // 6. Web Server Endpoints
-  server.on("/", HTTP_GET, handle_root);
+  // 5. Lightweight local fallback server
   server.on("/api/status", HTTP_GET, handle_status_api);
-
-  // Captive portal probes from iOS, Android, and Windows
-  server.on("/generate_204", handle_root);
-  server.on("/hotspot-detect.html", handle_root);
-  server.on("/canonical.html", handle_root);
-  server.on("/connecttest.txt", handle_root);
-  server.on("/ncsi.txt", handle_root);
-
-  // Catch-all: redirect any unknown request to the dashboard
-  server.onNotFound(handle_captive_redirect);
-
   server.begin();
-  Serial.println(F("[HTTP] Web dashboard server started on port 80."));
-  Serial.println(F("--------------------------------------------------"));
-  Serial.println(F("HOW TO ACCESS THE DASHBOARD:"));
-  Serial.println(F("1. Connect your phone or laptop to WiFi: PBL-MC"));
-  Serial.println(F("2. Open your browser and go to: http://192.168.4.1/"));
-  Serial.println(F("   (Make sure to use http:// and NOT https://)"));
+
+  Serial.printf("[TELEMETRY] Configured target: http://%s:%d%s\n",
+                DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_PATH);
   Serial.println(F("==================================================\n"));
 }
 
@@ -768,12 +451,6 @@ void setup() {
 // Main Loop
 // ----------------------------------------------------------------------------
 void loop() {
-  // Service DNS requests for captive portal
-  if (captive_portal_active) {
-    dnsServer.processNextRequest();
-  }
-
-  // Service HTTP clients
   server.handleClient();
 
   uint32_t now = millis();
@@ -784,13 +461,18 @@ void loop() {
     update_rolling_rates();
   }
 
-  // 2. Check STA connection status & manage NAPT routing state
+  // 2. Transmit telemetry to Web Dashboard every POST_INTERVAL_MS
+  if (now - last_post_tick >= POST_INTERVAL_MS) {
+    last_post_tick = now;
+    send_telemetry_post();
+  }
+
+  // 3. Check STA connection status & manage NAPT routing state
   if (WiFi.status() == WL_CONNECTED) {
     if (!sta_connected) {
       sta_connected = true;
       Serial.println(F("\n[STA] Upstream WiFi connected!"));
-      Serial.printf("[STA] ESP32 IP on '%s': %s\n", STA_SSID, WiFi.localIP().toString().c_str());
-      Serial.printf("[STA] Channel in use: %d\n", WiFi.channel());
+      Serial.printf("[STA] ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
 
       // Enable NAPT routing
       init_napt_routing();
@@ -800,20 +482,13 @@ void loop() {
       sta_connected = false;
       napt_active = false;
       Serial.println(F("\n[STA] Upstream WiFi disconnected."));
-
-      // Re-enable captive DNS so clients can access 192.168.4.1 without internet
-      if (!captive_portal_active) {
-        dnsServer.start(53, "*", apIP);
-        captive_portal_active = true;
-        Serial.println(F("[DNS] Captive DNS re-enabled."));
-      }
     }
 
-    // Gentle auto-retry connection every 15 seconds if disconnected
+    // Auto-retry connection every 15 seconds if disconnected
     if (now - sta_last_retry_ms >= 15000UL) {
       sta_last_retry_ms = now;
       if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("[STA] Checking connection to '%s'...\n", STA_SSID);
+        Serial.printf("[STA] Re-trying connection to '%s'...\n", STA_SSID);
         WiFi.begin(STA_SSID, STA_PASS);
       }
     }

@@ -1,0 +1,1 @@
+1)  make the network anlaysiss witht esp32 itself.

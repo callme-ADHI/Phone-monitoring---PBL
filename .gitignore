@@ -1,0 +1,16 @@
+# Python / Virtualenv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pt
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+.DS_Store
+*.local
+.env

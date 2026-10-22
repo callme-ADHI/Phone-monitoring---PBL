@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #07070f;
+}
+
+html {
+  overflow-y: scroll; /* prevent layout shift on content change */
+}
+
+body {
+  background: var(--bg);
+  color: #fff;
+}
+
+/* Smooth number rendering for the hero count */
+.tabular-hero {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}

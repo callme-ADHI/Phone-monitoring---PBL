@@ -31,7 +31,34 @@ export function PhoneDashboard({ data, onRefresh }: PhoneDashboardProps) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Quick ESP32 Gateway IP Config */}
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800/80 border border-slate-700/70 text-xs">
+            <span className="text-slate-400">ESP32 IP:</span>
+            <input
+              type="text"
+              defaultValue={data.sta_ip || '10.38.17.251'}
+              onBlur={async (e) => {
+                const newIp = e.target.value.trim();
+                if (newIp) {
+                  await fetch('/api/esp32/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip: newIp }),
+                  });
+                  if (onRefresh) onRefresh();
+                }
+              }}
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter') {
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              className="w-28 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-indigo-300 text-xs focus:outline-none focus:border-indigo-500"
+              title="Click and press Enter to change ESP32 IP"
+            />
+          </div>
+
           <button
             onClick={async () => {
               try {

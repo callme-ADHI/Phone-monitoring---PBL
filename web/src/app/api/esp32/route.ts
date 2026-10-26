@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { findStudentByMac, getStudents, getClassSchedules } from '@/lib/supabase';
 import { DeviceTelemetry, ESP32Telemetry } from '@/types/occupancy';
+import { getTargetEsp32Ip, setTargetEsp32Ip } from '@/lib/esp32Config';
 
 // In-memory telemetry cache for the latest ESP32 state
 let latestEsp32Data: ESP32Telemetry = {
@@ -100,9 +101,11 @@ export async function GET() {
 
   // Fallback Polling: If no push telemetry received recently, query ESP32 directly
   if (!isAlive) {
+    const currentConfigIp = getTargetEsp32Ip();
     const candidateUrls = [
-      'http://10.38.17.193/api/status',
+      `http://${currentConfigIp}/api/status`,
       'http://192.168.4.1/api/status',
+      'http://10.38.17.251/api/status',
     ];
 
     for (const url of candidateUrls) {
@@ -113,6 +116,9 @@ export async function GET() {
         });
         if (res.ok) {
           const directData = await res.json();
+          if (directData.sta_ip && directData.sta_ip !== '0.0.0.0') {
+            setTargetEsp32Ip(directData.sta_ip);
+          }
           latestEsp32Data = {
             connected_count: Number(directData.connected_count) || 0,
             internet_allowed: directData.internet_allowed !== undefined ? Boolean(directData.internet_allowed) : true,
@@ -121,7 +127,7 @@ export async function GET() {
             ap_ip: directData.ap_ip || '192.168.4.1',
             sta_ssid: directData.sta_ssid || 'VoiDX',
             sta_status: directData.sta_status || 'connected',
-            sta_ip: directData.sta_ip || '10.38.17.193',
+            sta_ip: directData.sta_ip || currentConfigIp,
             channel: Number(directData.channel) || 6,
             uptime_secs: Number(directData.uptime_secs) || 0,
             devices: Array.isArray(directData.devices) ? directData.devices : [],

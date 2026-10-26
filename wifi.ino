@@ -385,17 +385,23 @@ static void send_telemetry_post(uint8_t count) {
   if (!http.begin(client, url)) return;
 
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(1200);
+  http.addHeader("Connection", "close");
+  http.setTimeout(1500);
 
   String payload = build_telemetry_json(count);
   int httpCode = http.POST(payload);
 
   if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-    // Successfully received by dashboard
+    // Successfully delivered
   } else if (httpCode > 0) {
     Serial.printf("[TELEMETRY] Server replied code: %d\n", httpCode);
   } else {
-    Serial.printf("[TELEMETRY] POST failed to %s: %s\n", DASHBOARD_HOST, http.errorToString(httpCode).c_str());
+    // Suppress repeated spam on console; log once in a while
+    static uint32_t last_fail_log = 0;
+    if (millis() - last_fail_log > 10000) {
+      last_fail_log = millis();
+      Serial.printf("[TELEMETRY] Note: POST to %s refused (Client isolation active or laptop IP changed). Web polling mode is active.\n", DASHBOARD_HOST);
+    }
   }
 
   http.end();

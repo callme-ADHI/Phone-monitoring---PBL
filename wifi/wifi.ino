@@ -285,11 +285,18 @@ static String build_telemetry_json(uint8_t connected_count) {
     if (idle_s < 10) usage = "active";
     else if (idle_s < 30) usage = "light";
 
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             d->mac[0], d->mac[1], d->mac[2], d->mac[3], d->mac[4], d->mac[5]);
+
     if (!first) json += ",";
     first = false;
 
     json += "{";
     json += "\"id\":\"" + String(d->anon_id) + "\",";
+    json += "\"mac\":\"" + String(mac_str) + "\",";
+    json += "\"ip\":\"" + d->ip.toString() + "\",";
+    json += "\"rssi\":" + String(d->rssi) + ",";
     json += "\"up_pkts\":" + String(d->bytes_approx / 400 + 1) + ",";
     json += "\"up_bytes\":" + String(d->bytes_approx / 3) + ",";
     json += "\"down_pkts\":" + String(d->bytes_approx / 200 + 2) + ",";

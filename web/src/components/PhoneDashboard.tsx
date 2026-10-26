@@ -1,109 +1,131 @@
 'use client';
 
-import { motion } from 'framer-motion';
-import { Wifi, Globe, Clock, Radio, ArrowUpRight, ArrowDownLeft } from 'lucide-react';
-import type { ESP32Telemetry } from '@/types/occupancy';
+import { useState } from 'react';
+import { ESP32Telemetry } from '@/types/occupancy';
 import { PhoneTable } from './PhoneTable';
-import { StatCard } from './StatCard';
+import { ClassroomComplianceCard } from './ClassroomComplianceCard';
+import { StudentRegistryModal } from './StudentRegistryModal';
+import { Wifi, Router, Users, ShieldAlert, UserPlus, Radio, Activity } from 'lucide-react';
 
-interface Props {
-  telemetry: ESP32Telemetry;
-  secondsSinceUpdate: number;
+interface PhoneDashboardProps {
+  data: ESP32Telemetry;
+  onRefresh?: () => void;
 }
 
-function fmtBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1048576).toFixed(2)} MB`;
-}
-
-function fmtUptime(sec: number): string {
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-export function PhoneDashboard({ telemetry, secondsSinceUpdate }: Props) {
-  const totalUpBytes = telemetry.devices.reduce((acc, d) => acc + d.up_bytes, 0);
-  const totalDownBytes = telemetry.devices.reduce((acc, d) => acc + d.down_bytes, 0);
+export function PhoneDashboard({ data, onRefresh }: PhoneDashboardProps) {
+  const [showRegisterModal, setShowRegisterModal] = useState(false);
 
   return (
-    <div className="w-full max-w-5xl space-y-6">
-      {/* ── Hero Phone Count ────────────────────────────────────────── */}
-      <div className="flex flex-col items-center justify-center py-6 text-center">
-        <div className="relative">
-          <motion.div
-            className="absolute rounded-full blur-[90px] -z-10 w-full h-full scale-150 bg-sky-500/15"
-            animate={{ opacity: telemetry.connected_count > 0 ? 0.25 : 0.08 }}
-            transition={{ duration: 0.8 }}
-          />
-          <span className="font-mono block font-black leading-none text-sky-400 text-7xl sm:text-9xl select-none">
-            {telemetry.connected_count}
+    <div className="space-y-6">
+      {/* Top Banner & Quick Actions */}
+      <div className="flex flex-wrap items-center justify-between gap-4 p-5 rounded-2xl bg-slate-900/50 border border-slate-800 backdrop-blur-sm">
+        <div className="flex items-center gap-3">
+          <div className="p-3 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
+            <Radio className="w-6 h-6 animate-pulse" />
+          </div>
+          <div>
+            <h1 className="text-lg font-bold text-white tracking-tight">Classroom Network & Phone Monitor</h1>
+            <p className="text-xs text-slate-400">
+              ESP32 SoftAP &bull; Automatic MAC Address Resolution &bull; Real-time Usage Compliance
+            </p>
+          </div>
+        </div>
+
+        <button
+          onClick={() => setShowRegisterModal(true)}
+          className="flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/30 transition-all hover:scale-[1.02] active:scale-[0.98]"
+        >
+          <UserPlus className="w-4 h-4" />
+          <span>Register Student Device</span>
+        </button>
+      </div>
+
+      {/* Classroom Compliance Policy Card */}
+      <ClassroomComplianceCard
+        schedule={data.active_schedule}
+        summary={data.compliance_summary}
+      />
+
+      {/* Hardware Telemetry Stat Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 mb-2">
+            <span className="text-xs font-medium">Connected Devices</span>
+            <Users className="w-4 h-4 text-indigo-400" />
+          </div>
+          <div className="text-2xl font-bold text-white font-mono">{data.connected_count}</div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            {data.compliance_summary?.registered_count || 0} registered students
+          </div>
+        </div>
+
+        <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 mb-2">
+            <span className="text-xs font-medium">Policy Violations</span>
+            <ShieldAlert className="w-4 h-4 text-red-400" />
+          </div>
+          <div className={`text-2xl font-bold font-mono ${
+            (data.compliance_summary?.violations_count || 0) > 0 ? 'text-red-400' : 'text-slate-200'
+          }`}>
+            {data.compliance_summary?.violations_count || 0}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            {(data.compliance_summary?.violations_count || 0) > 0 ? 'Active in-class usage' : 'No violations'}
+          </div>
+        </div>
+
+        <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 mb-2">
+            <span className="text-xs font-medium">Upstream Internet</span>
+            <Wifi className="w-4 h-4 text-emerald-400" />
+          </div>
+          <div className="text-base font-semibold text-white truncate font-mono">
+            {data.sta_ssid || 'Hostel_Guest'}
+          </div>
+          <div className="text-[11px] text-emerald-400 flex items-center gap-1 mt-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            {data.sta_status === 'connected' ? `NAT Active (${data.sta_ip})` : 'Connecting...'}
+          </div>
+        </div>
+
+        <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 mb-2">
+            <span className="text-xs font-medium">ESP32 Router AP</span>
+            <Router className="w-4 h-4 text-purple-400" />
+          </div>
+          <div className="text-base font-semibold text-white font-mono">
+            {data.ap_ssid || 'PBL-MC'}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            IP {data.ap_ip} &bull; Ch {data.channel}
+          </div>
+        </div>
+      </div>
+
+      {/* Connected Phones & Enriched Student Table */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+            <Activity className="w-4 h-4 text-indigo-400" />
+            <span>Active Connected Phones</span>
+          </h2>
+          <span className="text-xs text-slate-500">
+            {data.devices?.length || 0} active station(s)
           </span>
         </div>
-        <p className="text-xs text-white/35 uppercase tracking-widest mt-4">
-          Phones Connected to <span className="text-white/60 font-semibold">{telemetry.ap_ssid}</span>
-        </p>
 
-        {/* Status badges */}
-        <div className="flex items-center gap-2.5 mt-3 flex-wrap justify-center">
-          <span
-            className={`px-3 py-1 rounded-full text-[11px] font-semibold tracking-wider uppercase border ${
-              telemetry.routing_status === 'active'
-                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-            }`}
-          >
-            Internet NAT: {telemetry.routing_status}
-          </span>
-          <span className="px-3 py-1 rounded-full text-[11px] font-semibold tracking-wider text-white/50 bg-white/5 border border-white/10">
-            AP IP: {telemetry.ap_ip}
-          </span>
-          <span className="px-3 py-1 rounded-full text-[11px] font-semibold tracking-wider text-white/50 bg-white/5 border border-white/10">
-            STA IP: {telemetry.sta_ip}
-          </span>
-        </div>
+        <PhoneTable devices={data.devices || []} onRefresh={onRefresh} />
       </div>
 
-      {/* ── Stat Cards Grid ─────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard
-          icon={Globe}
-          label="Upstream Network"
-          value={telemetry.sta_ssid}
-          subtext={`Status: ${telemetry.sta_status}`}
-        />
-        <StatCard
-          icon={Radio}
-          label="WiFi Channel"
-          value={`Ch ${telemetry.channel}`}
-          subtext="AP/STA locked frequency"
-        />
-        <StatCard
-          icon={ArrowUpRight}
-          label="Total Upload"
-          value={fmtBytes(totalUpBytes)}
-          subtext="Clients to Internet"
-        />
-        <StatCard
-          icon={ArrowDownLeft}
-          label="Total Download"
-          value={fmtBytes(totalDownBytes)}
-          subtext="Internet to Clients"
-        />
-      </div>
-
-      {/* ── Connected Devices Table ─────────────────────────────────── */}
-      <PhoneTable devices={telemetry.devices} />
-
-      {/* ── Telemetry Health Footer ─────────────────────────────────── */}
-      <div className="text-center text-[11px] text-white/25 pt-2">
-        ESP32 Uptime: {fmtUptime(telemetry.uptime_secs)} • Telemetry{' '}
-        {telemetry.is_alive ? `updated ${secondsSinceUpdate}s ago` : 'waiting for ESP32 connection'}
-      </div>
+      {/* Manual Student Device Registration Modal */}
+      <StudentRegistryModal
+        isOpen={showRegisterModal}
+        onClose={() => setShowRegisterModal(false)}
+        onSuccess={() => {
+          setShowRegisterModal(false);
+          if (onRefresh) onRefresh();
+        }}
+      />
     </div>
   );
 }

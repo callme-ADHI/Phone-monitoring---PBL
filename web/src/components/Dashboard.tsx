@@ -93,8 +93,8 @@ export function Dashboard({ defaultTab = 'combined' }: Props) {
               className="w-full flex justify-center"
             >
               <PhoneDashboard
-                telemetry={phoneData.telemetry}
-                secondsSinceUpdate={phoneData.secondsSinceUpdate}
+                data={phoneData.telemetry}
+                onRefresh={phoneData.refresh}
               />
             </motion.div>
           )}

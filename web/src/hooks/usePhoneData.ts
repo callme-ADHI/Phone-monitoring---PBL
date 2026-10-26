@@ -7,6 +7,7 @@ export interface PhoneData {
   telemetry: ESP32Telemetry;
   secondsSinceUpdate: number;
   isConnected: boolean;
+  refresh: () => Promise<void>;
 }
 
 const POLL_INTERVAL_MS = 1500;
@@ -17,10 +18,10 @@ export function usePhoneData(): PhoneData {
     routing_status: 'unavailable',
     ap_ssid: 'PBL-MC',
     ap_ip: '192.168.4.1',
-    sta_ssid: 'VoiDX',
+    sta_ssid: 'Hostel_Guest',
     sta_status: 'disconnected',
     sta_ip: '0.0.0.0',
-    channel: 1,
+    channel: 6,
     uptime_secs: 0,
     devices: [],
     is_alive: false,
@@ -57,5 +58,6 @@ export function usePhoneData(): PhoneData {
     telemetry,
     secondsSinceUpdate: secondsSince,
     isConnected: !!telemetry.is_alive,
+    refresh: fetchPhoneData,
   };
 }

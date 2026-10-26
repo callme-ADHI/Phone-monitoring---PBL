@@ -31,13 +31,33 @@ export function PhoneDashboard({ data, onRefresh }: PhoneDashboardProps) {
           </div>
         </div>
 
-        <button
-          onClick={() => setShowRegisterModal(true)}
-          className="flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/30 transition-all hover:scale-[1.02] active:scale-[0.98]"
-        >
-          <UserPlus className="w-4 h-4" />
-          <span>Register Student Device</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={async () => {
+              try {
+                await fetch('/api/esp32/toggle', { method: 'POST' });
+                if (onRefresh) onRefresh();
+              } catch (e) {
+                console.error(e);
+              }
+            }}
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-all ${
+              data.internet_allowed === false
+                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 hover:bg-amber-500/30'
+                : 'bg-red-500/10 border-red-500/20 text-red-400 hover:bg-red-500/20'
+            }`}
+          >
+            <span>{data.internet_allowed === false ? 'Unblock Internet' : 'Cut Classroom Internet'}</span>
+          </button>
+
+          <button
+            onClick={() => setShowRegisterModal(true)}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/30 transition-all hover:scale-[1.02] active:scale-[0.98]"
+          >
+            <UserPlus className="w-4 h-4" />
+            <span>Register Student Device</span>
+          </button>
+        </div>
       </div>
 
       {/* Classroom Compliance Policy Card */}

@@ -34,6 +34,7 @@ export function PhoneTable({ devices, onRefresh }: PhoneTableProps) {
               <th scope="col" className="px-4 py-3.5 font-semibold">Student / Device</th>
               <th scope="col" className="px-4 py-3.5 font-semibold">MAC & IP Address</th>
               <th scope="col" className="px-4 py-3.5 font-semibold">Classroom Status</th>
+              <th scope="col" className="px-4 py-3.5 font-semibold">Active Domain / DNS</th>
               <th scope="col" className="px-4 py-3.5 font-semibold">Outgoing (TX)</th>
               <th scope="col" className="px-4 py-3.5 font-semibold">Incoming (RX)</th>
               <th scope="col" className="px-4 py-3.5 font-semibold">Rate</th>
@@ -133,6 +134,16 @@ export function PhoneTable({ devices, onRefresh }: PhoneTableProps) {
                           Off Hours
                         </span>
                       )}
+                    </td>
+
+                    {/* Active Domain / DNS Sniffer */}
+                    <td className="px-4 py-3.5 whitespace-nowrap">
+                      <div className="font-mono text-[11px] text-indigo-300 max-w-[150px] truncate" title={device.last_domain || 'None'}>
+                        {device.last_domain || 'None'}
+                      </div>
+                      <div className="text-[10px] text-slate-500">
+                        {device.dns_queries || 0} query(s)
+                      </div>
                     </td>
 
                     {/* Outgoing TX Traffic */}

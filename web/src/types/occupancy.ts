@@ -18,6 +18,8 @@ export interface DeviceTelemetry {
   rate_bps: number;
   usage: 'idle' | 'light' | 'active';
   idle_secs: number;
+  dns_queries?: number;
+  last_domain?: string;
   // Student & Compliance Resolution
   student_id?: string;
   student_name?: string;
@@ -55,6 +57,7 @@ export interface StudentRecord {
 
 export interface ESP32Telemetry {
   connected_count: number;
+  internet_allowed?: boolean;
   routing_status: 'active' | 'unavailable';
   ap_ssid: string;
   ap_ip: string;

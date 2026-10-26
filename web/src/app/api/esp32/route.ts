@@ -58,6 +58,8 @@ async function enrichDevicesWithIdentityAndCompliance(devices: any[]) {
       down_pkts: Number(raw.down_pkts) || 0,
       down_bytes: Number(raw.down_bytes) || 0,
       rate_bps: Number(raw.rate_bps) || 0,
+      dns_queries: Number(raw.dns_queries) || 0,
+      last_domain: raw.last_domain || 'None',
       usage: raw.usage || (raw.idle_secs < 10 ? 'active' : 'idle'),
       idle_secs: Number(raw.idle_secs) || 0,
       student_id: match?.student.id,
@@ -151,6 +153,7 @@ export async function POST(req: NextRequest) {
 
     latestEsp32Data = {
       connected_count: Number(payload.connected_count) || 0,
+      internet_allowed: payload.internet_allowed !== undefined ? Boolean(payload.internet_allowed) : true,
       routing_status: payload.routing_status === 'active' ? 'active' : 'unavailable',
       ap_ssid: payload.ap_ssid || 'PBL-MC',
       ap_ip: payload.ap_ip || '192.168.4.1',

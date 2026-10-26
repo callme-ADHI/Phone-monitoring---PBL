@@ -1,25 +1,25 @@
 /*
  * ============================================================================
- * Project: ESP32 WiFi Router & Occupancy Telemetry Node
+ * Project: ESP32 WiFi Router & Classroom Occupancy Monitor
  * File:    wifi.ino
  *
  * Target:
  *   ESP32 Dev Module (standard WROOM-32)
  *   Targeted Core: arduino-esp32 v3.x (ESP-IDF 5.x) & v2.x
  *
- * Architecture (Based on official Espressif WiFiExtender):
- *   1. Rock-solid SoftAP: Correct DHCP lease range (192.168.4.2..20) configured
- *      BEFORE AP creation to ensure smartphones obtain IP instantly.
- *   2. WiFi modem sleep disabled (WiFi.setSleep(false)) so the AP never drops packets.
- *   3. Native WiFi events track exact phone connections and IP assignments.
- *   4. Official built-in NAPT IP routing (WiFi.AP.enableNAPT(true)).
- *   5. Captive DNS responder prevents smartphones from disconnecting.
- *   6. Streams real-time occupancy telemetry to external Next.js web dashboard.
+ * Features:
+ *   1. Rock-solid Dual AP+STA WiFi NAT Router (NAPT).
+ *   2. Real hardware MAC address reporting + DHCP IP mapping.
+ *   3. DNS Traffic Sniffer: Intercepts & logs requested domains per phone.
+ *   4. Remote Internet Kill-Switch (/api/toggle) to cut phone access in class.
+ *   5. Streams telemetry to Next.js Web Dashboard & Supabase database.
+ *   6. Embedded Web Server for local control at 192.168.4.1.
  * ============================================================================
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -33,56 +33,60 @@
 
 // SoftAP settings (Student phones connect here)
 static const char* AP_SSID = "PBL-MC";
-static const char* AP_PASS = "12345678";    // WPA2 requires >= 8 chars. Leave "" for OPEN network.
-static const int   AP_CHANNEL = 6;          // Set to 6 to match 2.4GHz channels and reduce hops
-static const int   AP_MAX_CLIENTS = 10;
+static const char* AP_PASS = "12345678";    // WPA2 requires >= 8 chars.
+static const int   AP_CHANNEL = 6;
+static const int   AP_MAX_CLIENTS = 16;
 
 // IP & DHCP Lease Configuration
 static const IPAddress ap_ip(192, 168, 4, 1);
 static const IPAddress ap_mask(255, 255, 255, 0);
 static const IPAddress ap_leaseStart(192, 168, 4, 2);
-static const IPAddress ap_dns(8, 8, 8, 8);
+static const IPAddress ap_dns(192, 168, 4, 1); // Point DNS to ESP32 for domain inspection
 
-// Upstream WiFi settings (Internet connection from Hostel / Mobile Hotspot / Home)
+// Upstream WiFi settings (Internet connection from Router / Hotspot)
 static const char* STA_SSID = "VoiDX";
-static const char* STA_PASS = "sunisgood";           // Leave "" if open network, or enter your WiFi password
+static const char* STA_PASS = "sunisgood";
 
-// External Web Dashboard server (Where Next.js 'web' is running)
-// Current IP of your laptop on VoiDX: 10.38.17.190
+// External Web Dashboard server
 static const char* DASHBOARD_HOST = "10.38.17.190";
 static const int   DASHBOARD_PORT = 3000;
 static const char* DASHBOARD_PATH = "/api/esp32";
 #define POST_INTERVAL_MS 1500
 
 // ----------------------------------------------------------------------------
-// Device Tracking State
+// Device & DNS Tracking State
 // ----------------------------------------------------------------------------
 #define MAX_TRACKED_DEVICES 16
 
 struct TrackedClient {
-  uint8_t  mac[6];
-  char     anon_id[7];
+  uint8_t   mac[6];
+  char      anon_id[7];
   IPAddress ip;
-  int8_t   rssi;
-  uint32_t connected_at_ms;
-  uint32_t last_seen_ms;
-  uint32_t bytes_approx;
+  int8_t    rssi;
+  uint32_t  connected_at_ms;
+  uint32_t  last_seen_ms;
+  uint32_t  bytes_approx;
+  uint32_t  dns_queries;
+  char      last_domain[64];
   const char* usage;
-  bool     active;
+  bool      active;
 };
 
 static TrackedClient tracked_clients[MAX_TRACKED_DEVICES];
 static uint32_t boot_salt = 0;
 static bool     sta_has_ip = false;
 static bool     napt_running = false;
-static bool     captive_active = false;
+static bool     internet_allowed = true; // Controlled remotely via web or local API
 static uint32_t last_post_ms = 0;
 
 WebServer server(80);
-DNSServer dnsServer;
+WiFiUDP dnsServer;
+WiFiUDP dnsUpstream;
+const uint16_t DNS_PORT = 53;
+IPAddress publicDns(8, 8, 8, 8);
 
 // ----------------------------------------------------------------------------
-// Anonymization Hash (Runs strictly in main thread)
+// Anonymization Hash
 // ----------------------------------------------------------------------------
 static void compute_anon_id(const uint8_t* mac, char* out_str) {
   uint32_t h = 2166136261u ^ boot_salt;
@@ -94,27 +98,105 @@ static void compute_anon_id(const uint8_t* mac, char* out_str) {
 }
 
 // ----------------------------------------------------------------------------
-// WiFi Event Handler (Official Espressif Network.onEvent)
+// DNS Packet Parser (Extract domain being requested by phone)
+// ----------------------------------------------------------------------------
+static String parse_dns_domain(const uint8_t* buffer, int length) {
+  if (length <= 12) return "Unknown";
+  String domain = "";
+  int i = 12;
+  while (i < length && buffer[i] != 0) {
+    uint8_t labelLen = buffer[i];
+    if (i + 1 + labelLen > length) break;
+    if (domain.length() > 0) domain += ".";
+    for (int j = 0; j < labelLen; j++) {
+      domain += (char)buffer[i + 1 + j];
+    }
+    i += (1 + labelLen);
+  }
+  return domain.length() > 0 ? domain : "Unknown";
+}
+
+// Record domain activity to the matching client by IP
+static void record_dns_activity(IPAddress clientIP, const String& domain) {
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+    if (tracked_clients[i].active && tracked_clients[i].ip == clientIP) {
+      tracked_clients[i].dns_queries++;
+      tracked_clients[i].last_seen_ms = now;
+      tracked_clients[i].bytes_approx += 1500;
+      strncpy(tracked_clients[i].last_domain, domain.c_str(), sizeof(tracked_clients[i].last_domain) - 1);
+      tracked_clients[i].last_domain[sizeof(tracked_clients[i].last_domain) - 1] = '\0';
+      return;
+    }
+  }
+
+  // If IP not matched yet, assign to first active client with 0.0.0.0
+  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+    if (tracked_clients[i].active && tracked_clients[i].ip == IPAddress(0, 0, 0, 0)) {
+      tracked_clients[i].ip = clientIP;
+      tracked_clients[i].dns_queries++;
+      tracked_clients[i].last_seen_ms = now;
+      tracked_clients[i].bytes_approx += 1500;
+      strncpy(tracked_clients[i].last_domain, domain.c_str(), sizeof(tracked_clients[i].last_domain) - 1);
+      return;
+    }
+  }
+}
+
+// Proxy DNS queries upstream to public DNS & track requested domain
+static void process_dns_proxy() {
+  int packetSize = dnsServer.parsePacket();
+  if (packetSize <= 0) return;
+
+  uint8_t buffer[512];
+  int bytesRead = dnsServer.read(buffer, sizeof(buffer));
+  IPAddress clientIP = dnsServer.remoteIP();
+  uint16_t clientPort = dnsServer.remotePort();
+
+  if (bytesRead > 0) {
+    String domain = parse_dns_domain(buffer, bytesRead);
+    record_dns_activity(clientIP, domain);
+
+    if (internet_allowed && sta_has_ip) {
+      dnsUpstream.beginPacket(publicDns, DNS_PORT);
+      dnsUpstream.write(buffer, bytesRead);
+      dnsUpstream.endPacket();
+
+      uint32_t startTime = millis();
+      while (millis() - startTime < 120) {
+        int respSize = dnsUpstream.parsePacket();
+        if (respSize > 0) {
+          int respRead = dnsUpstream.read(buffer, sizeof(buffer));
+          if (respRead > 0) {
+            dnsServer.beginPacket(clientIP, clientPort);
+            dnsServer.write(buffer, respRead);
+            dnsServer.endPacket();
+          }
+          break;
+        }
+        delay(2);
+      }
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// WiFi Event Handler
 // ----------------------------------------------------------------------------
 void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
   uint32_t now = millis();
 
   switch (event) {
-    // --- SoftAP Events (Phone joins / leaves) ---
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED: {
-      uint8_t* mac = info.wifi_ap_staconnected.mac;
-      Serial.printf("\n[AP EVENT] Phone CONNECTED! MAC: %02X:%02X:%02X:%02X:%02X:%02X | Total Phones: %d\n",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], WiFi.AP.stationCount());
-
-      // Register or reactivate device
+      const uint8_t* mac = info.wifi_ap_staconnected.mac;
       int slot = -1;
       for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
-        if (memcmp(tracked_clients[i].mac, mac, 6) == 0) {
+        if (tracked_clients[i].active && memcmp(tracked_clients[i].mac, mac, 6) == 0) {
           slot = i;
           break;
         }
       }
-      if (slot < 0) {
+      if (slot == -1) {
         for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
           if (!tracked_clients[i].active) {
             slot = i;
@@ -122,83 +204,62 @@ void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
           }
         }
       }
-      if (slot >= 0) {
+
+      if (slot != -1) {
         TrackedClient* c = &tracked_clients[slot];
         memcpy(c->mac, mac, 6);
         compute_anon_id(mac, c->anon_id);
+        c->ip = IPAddress(0, 0, 0, 0);
         c->connected_at_ms = now;
         c->last_seen_ms = now;
-        c->active = true;
+        c->bytes_approx = 4096;
+        c->dns_queries = 0;
+        strcpy(c->last_domain, "None");
         c->usage = "active";
-        c->bytes_approx = 45000;
-        Serial.printf("[AP EVENT] Device assigned anonymous ID: DEV-%s\n", c->anon_id);
+        c->active = true;
+
+        Serial.printf("\n[AP EVENT] Phone CONNECTED! MAC: %02X:%02X:%02X:%02X:%02X:%02X | Total: %d\n",
+                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], info.wifi_ap_staconnected.aid);
       }
       break;
     }
 
     case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED: {
-      IPAddress assignedIp(info.wifi_ap_staipassigned.ip.addr);
-      Serial.printf("[AP EVENT] Phone DHCP Success! Assigned IP: %s\n", assignedIp.toString().c_str());
-      // Match to the most recently connected active client without an IP
+      IPAddress assigned_ip(info.wifi_ap_staipassigned.ip.addr);
       for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
-        if (tracked_clients[i].active && tracked_clients[i].ip == IPAddress(0, 0, 0, 0)) {
-          tracked_clients[i].ip = assignedIp;
+        if (tracked_clients[i].active && (tracked_clients[i].ip == IPAddress(0, 0, 0, 0) || tracked_clients[i].ip == assigned_ip)) {
+          tracked_clients[i].ip = assigned_ip;
+          tracked_clients[i].last_seen_ms = now;
           break;
         }
       }
+      Serial.printf("[AP EVENT] Phone DHCP Success! Assigned IP: %s\n", assigned_ip.toString().c_str());
       break;
     }
 
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED: {
-      uint8_t* mac = info.wifi_ap_stadisconnected.mac;
-      Serial.printf("\n[AP EVENT] Phone DISCONNECTED. MAC: %02X:%02X:%02X:%02X:%02X:%02X | Total Phones: %d\n",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], WiFi.AP.stationCount());
+      const uint8_t* mac = info.wifi_ap_stadisconnected.mac;
       for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
-        if (memcmp(tracked_clients[i].mac, mac, 6) == 0) {
+        if (tracked_clients[i].active && memcmp(tracked_clients[i].mac, mac, 6) == 0) {
           tracked_clients[i].active = false;
-          tracked_clients[i].ip = IPAddress(0, 0, 0, 0);
+          Serial.printf("\n[AP EVENT] Phone DISCONNECTED! MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
           break;
         }
       }
       break;
     }
 
-    // --- Station Events (Upstream connection to router/hotspot) ---
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.printf("\n[STA EVENT] Upstream WiFi '%s' Connected! Waiting for IP...\n", STA_SSID);
-      break;
-
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       sta_has_ip = true;
       Serial.printf("\n[STA EVENT] Got IP on '%s': %s\n", STA_SSID, WiFi.localIP().toString().c_str());
-
-      // Enable native NAPT routing
-      WiFi.AP.enableNAPT(true);
-      napt_running = true;
-      Serial.println(F("[ROUTER] NAPT Enabled! Phones now have full Internet access routed through ESP32."));
-
-      // Stop captive DNS once real internet routing is active
-      if (captive_active) {
-        dnsServer.stop();
-        captive_active = false;
-        Serial.println(F("[DNS] Captive DNS disabled (phones now resolve real domains)."));
-      }
       break;
-    }
 
-    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       sta_has_ip = false;
       napt_running = false;
       WiFi.AP.enableNAPT(false);
       Serial.println(F("\n[STA EVENT] Upstream WiFi disconnected."));
-
-      // Restart captive DNS so phones don't disconnect due to missing internet
-      if (!captive_active) {
-        dnsServer.start(53, "*", ap_ip);
-        captive_active = true;
-        Serial.println(F("[DNS] Captive DNS re-enabled to keep phones connected."));
-      }
       break;
 
     default:
@@ -215,8 +276,6 @@ static uint8_t sync_hardware_stations() {
   if (err != ESP_OK) return 0;
 
   uint32_t now = millis();
-
-  // Update RSSI and active status for each hardware client
   for (int i = 0; i < sta_list.num; i++) {
     const uint8_t* mac = sta_list.sta[i].mac;
     int8_t rssi = sta_list.sta[i].rssi;
@@ -225,15 +284,12 @@ static uint8_t sync_hardware_stations() {
     for (int d = 0; d < MAX_TRACKED_DEVICES; d++) {
       if (tracked_clients[d].active && memcmp(tracked_clients[d].mac, mac, 6) == 0) {
         tracked_clients[d].rssi = rssi;
-        tracked_clients[d].last_seen_ms = now;
-        tracked_clients[d].bytes_approx += 1500; // Increment approximate traffic
         found = true;
         break;
       }
     }
 
     if (!found) {
-      // Allocate slot if event was missed
       for (int d = 0; d < MAX_TRACKED_DEVICES; d++) {
         if (!tracked_clients[d].active) {
           TrackedClient* c = &tracked_clients[d];
@@ -242,9 +298,11 @@ static uint8_t sync_hardware_stations() {
           c->rssi = rssi;
           c->connected_at_ms = now;
           c->last_seen_ms = now;
+          c->bytes_approx = 8192;
+          c->dns_queries = 0;
+          strcpy(c->last_domain, "None");
           c->active = true;
           c->usage = "active";
-          c->bytes_approx = 15000;
           break;
         }
       }
@@ -262,6 +320,7 @@ static String build_telemetry_json(uint8_t connected_count) {
 
   String json = "{";
   json += "\"connected_count\":" + String(connected_count) + ",";
+  json += "\"internet_allowed\":" + String(internet_allowed ? "true" : "false") + ",";
   json += "\"routing_status\":\"" + String(napt_running ? "active" : "unavailable") + "\",";
   json += "\"ap_ssid\":\"" + String(AP_SSID) + "\",";
   json += "\"ap_ip\":\"" + ap_ip.toString() + "\",";
@@ -302,6 +361,8 @@ static String build_telemetry_json(uint8_t connected_count) {
     json += "\"down_pkts\":" + String(d->bytes_approx / 200 + 2) + ",";
     json += "\"down_bytes\":" + String(d->bytes_approx * 2 / 3) + ",";
     json += "\"rate_bps\":" + String(rate_bps) + ",";
+    json += "\"dns_queries\":" + String(d->dns_queries) + ",";
+    json += "\"last_domain\":\"" + String(d->last_domain) + "\",";
     json += "\"usage\":\"" + String(usage) + "\",";
     json += "\"idle_secs\":" + String(idle_s);
     json += "}";
@@ -330,7 +391,7 @@ static void send_telemetry_post(uint8_t count) {
   int httpCode = http.POST(payload);
 
   if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-    Serial.printf("[TELEMETRY] Pushed %d device(s) to %s (HTTP 200)\n", count, DASHBOARD_HOST);
+    // Successfully received by dashboard
   } else if (httpCode > 0) {
     Serial.printf("[TELEMETRY] Server replied code: %d\n", httpCode);
   } else {
@@ -341,14 +402,20 @@ static void send_telemetry_post(uint8_t count) {
 }
 
 // ----------------------------------------------------------------------------
-// Local Fallback JSON API (for direct access from browser at 192.168.4.1/api/status)
+// REST API Handlers on ESP32 Web Server
 // ----------------------------------------------------------------------------
-static void handle_status_api() {
+static void handle_api_status() {
   uint8_t count = sync_hardware_stations();
   String json = build_telemetry_json(count);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-cache");
   server.send(200, "application/json", json);
+}
+
+static void handle_api_toggle() {
+  internet_allowed = !internet_allowed;
+  Serial.printf("[CONTROL] Internet access toggled to: %s\n", internet_allowed ? "ALLOWED" : "BLOCKED");
+  handle_api_status();
 }
 
 // ----------------------------------------------------------------------------
@@ -367,10 +434,10 @@ void setup() {
   // 1. Register Native WiFi Events
   Network.onEvent(onWiFiEvent);
 
-  // 2. Disable modem sleep so the radio is 100% responsive and beacons are uninterrupted
+  // 2. Disable modem sleep for 100% stability
   WiFi.setSleep(false);
 
-  // 3. Configure and Start SoftAP (Correct sequence from official WiFiExtender)
+  // 3. Configure and Start SoftAP
   WiFi.AP.begin();
   WiFi.AP.config(ap_ip, ap_ip, ap_mask, ap_leaseStart, ap_dns);
 
@@ -378,35 +445,29 @@ void setup() {
   if (pass_len >= 8) {
     WiFi.AP.create(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CLIENTS);
   } else {
-    Serial.println(F("[AP] Starting open network (no password)."));
     WiFi.AP.create(AP_SSID, nullptr, AP_CHANNEL, false, AP_MAX_CLIENTS);
   }
 
-  if (!WiFi.AP.waitStatusBits(ESP_NETIF_STARTED_BIT, 1500)) {
-    Serial.println(F("[AP ERROR] Failed to start SoftAP interface!"));
-  } else {
-    Serial.printf("[AP READY] Network: '%s' | Password: '%s' | IP: %s\n",
-                  AP_SSID, pass_len >= 8 ? AP_PASS : "(open)", ap_ip.toString().c_str());
-    Serial.printf("[AP DHCP] Leasing pool: %s -> 192.168.4.20 | Channel: %d\n",
-                  ap_leaseStart.toString().c_str(), AP_CHANNEL);
-  }
+  Serial.printf("[AP READY] Network: '%s' | Password: '%s' | IP: %s\n",
+                AP_SSID, pass_len >= 8 ? AP_PASS : "(open)", ap_ip.toString().c_str());
 
-  // 4. Start Captive DNS Server (Handles mobile captive detection so phones don't disconnect)
-  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(53, "*", ap_ip);
-  captive_active = true;
-  Serial.println(F("[DNS] Captive DNS active on port 53 (prevents phones from dropping WiFi)."));
+  // 4. Start DNS Sniffer / Proxy on UDP Port 53
+  dnsServer.begin(DNS_PORT);
+  Serial.println(F("[DNS] DNS Sniffer & Proxy active on port 53."));
 
-  // 5. Connect to upstream WiFi (Non-blocking background connection)
+  // 5. Connect to upstream WiFi
   Serial.printf("[STA] Connecting to upstream WiFi '%s'...\n", STA_SSID);
   if (strlen(STA_PASS) > 0) {
     WiFi.begin(STA_SSID, STA_PASS);
   } else {
-    WiFi.begin(STA_SSID); // Open network
+    WiFi.begin(STA_SSID);
   }
 
-  // 6. Local HTTP status API
-  server.on("/api/status", HTTP_GET, handle_status_api);
+  // 6. Local HTTP Server & API endpoints
+  server.enableCORS(true);
+  server.on("/api/status", HTTP_GET, handle_api_status);
+  server.on("/api/toggle", HTTP_POST, handle_api_toggle);
+  server.on("/api/toggle", HTTP_GET, handle_api_toggle);
   server.begin();
 
   Serial.printf("[TELEMETRY] Target Web Dashboard: http://%s:%d%s\n",
@@ -418,13 +479,22 @@ void setup() {
 // Main Loop
 // ----------------------------------------------------------------------------
 void loop() {
-  // Service captive DNS requests
-  if (captive_active) {
-    dnsServer.processNextRequest();
+  server.handleClient();
+
+  // Manage NAPT state dynamically with internet_allowed kill-switch
+  bool targetNaptState = sta_has_ip && internet_allowed;
+  if (targetNaptState != napt_running) {
+    napt_running = targetNaptState;
+    WiFi.AP.enableNAPT(napt_running);
+    if (napt_running) {
+      Serial.println(F(">>> NAT ROUTER ACTIVE - Internet Routed <<<"));
+    } else {
+      Serial.println(F(">>> NAT ROUTER PAUSED - Internet Blocked <<<"));
+    }
   }
 
-  // Service local HTTP requests
-  server.handleClient();
+  // Process incoming DNS requests from student phones
+  process_dns_proxy();
 
   uint32_t now = millis();
 
@@ -434,4 +504,6 @@ void loop() {
     uint8_t count = sync_hardware_stations();
     send_telemetry_post(count);
   }
+
+  delay(2);
 }

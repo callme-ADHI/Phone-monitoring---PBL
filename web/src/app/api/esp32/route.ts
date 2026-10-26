@@ -3,13 +3,13 @@ import { findStudentByMac, getStudents, getClassSchedules } from '@/lib/supabase
 import { DeviceTelemetry, ESP32Telemetry } from '@/types/occupancy';
 import { getTargetEsp32Ip, setTargetEsp32Ip } from '@/lib/esp32Config';
 
-// In-memory telemetry cache for the latest ESP32 state
+// In-memory cache of last received telemetry
 let latestEsp32Data: ESP32Telemetry = {
   connected_count: 0,
   routing_status: 'unavailable',
   ap_ssid: 'PBL-MC',
-  ap_ip: '192.168.4.1',
-  sta_ssid: 'Hostel_Guest',
+  ap_ip: '192.168.199.1',
+  sta_ssid: 'VoiDX',
   sta_status: 'disconnected',
   sta_ip: '0.0.0.0',
   channel: 6,
@@ -18,7 +18,57 @@ let latestEsp32Data: ESP32Telemetry = {
   last_received_at: 0,
 };
 
-async function enrichDevicesWithIdentityAndCompliance(devices: any[]) {
+async function fetchFromEsp32(): Promise<boolean> {
+  const currentConfigIp = getTargetEsp32Ip();
+  // Try: user-configured IP → gateway AP IP → last known STA IP
+  const candidates = [
+    `http://${currentConfigIp}/api/status`,
+    'http://192.168.199.1/api/status',
+    'http://192.168.4.1/api/status',
+  ];
+
+  // Deduplicate while preserving order
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const u of candidates) { if (!seen.has(u)) { seen.add(u); urls.push(u); } }
+
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(1500),
+        cache: 'no-store',
+      });
+      if (!res.ok) continue;
+      const d = await res.json();
+
+      // Update config with discovered STA IP for future requests
+      if (d.sta_ip && d.sta_ip !== '0.0.0.0') {
+        setTargetEsp32Ip(d.sta_ip);
+      }
+
+      latestEsp32Data = {
+        connected_count: Number(d.connected_count) || 0,
+        internet_allowed: d.internet_allowed !== undefined ? Boolean(d.internet_allowed) : true,
+        routing_status: d.routing_status === 'active' ? 'active' : 'unavailable',
+        ap_ssid: d.ap_ssid || 'PBL-MC',
+        ap_ip: d.ap_ip || '192.168.199.1',
+        sta_ssid: d.sta_ssid || 'VoiDX',
+        sta_status: d.sta_status || 'connected',
+        sta_ip: d.sta_ip || currentConfigIp,
+        channel: Number(d.channel) || 6,
+        uptime_secs: Number(d.uptime_secs) || 0,
+        devices: Array.isArray(d.devices) ? d.devices : [],
+        last_received_at: Date.now(),
+      };
+      return true;
+    } catch {
+      // try next
+    }
+  }
+  return false;
+}
+
+async function enrichDevices(devices: any[]) {
   const schedules = await getClassSchedules();
   const activeSchedule = schedules.find((s) => s.in_session) || null;
   const allStudents = await getStudents();
@@ -27,27 +77,24 @@ async function enrichDevicesWithIdentityAndCompliance(devices: any[]) {
   const connectedStudentIds = new Set<string>();
 
   for (const raw of devices) {
-    const mac = raw.mac || raw.id || '';
-    const match = await findStudentByMac(mac);
+    const mac = (raw.mac || raw.id || '').trim().toUpperCase();
+    const match = mac ? await findStudentByMac(mac) : null;
+
+    const isActive =
+      (raw.up_bytes && raw.up_bytes > 2000) ||
+      raw.usage === 'active' ||
+      (raw.idle_secs !== undefined && raw.idle_secs < 15);
 
     let compliance_status: DeviceTelemetry['compliance_status'] = 'off_hours';
-    const isOutActive = (raw.up_bytes && raw.up_bytes > 5000) || raw.usage === 'active' || (raw.idle_secs !== undefined && raw.idle_secs < 15);
-
     if (activeSchedule) {
       if (match) {
-        // Registered Student Device
-        compliance_status = isOutActive ? 'violation_active' : 'compliant_idle';
+        compliance_status = isActive ? 'violation_active' : 'compliant_idle';
       } else {
-        // Unknown Device connected during class
-        compliance_status = isOutActive ? 'unregistered_active' : 'compliant_idle';
+        compliance_status = isActive ? 'unregistered_active' : 'compliant_idle';
       }
-    } else {
-      compliance_status = 'off_hours';
     }
 
-    if (match) {
-      connectedStudentIds.add(match.student.id);
-    }
+    if (match) connectedStudentIds.add(match.student.id);
 
     enrichedDevices.push({
       id: raw.id,
@@ -72,78 +119,41 @@ async function enrichDevicesWithIdentityAndCompliance(devices: any[]) {
     });
   }
 
-  // Calculate absent / not connected students during class
   const absent_students = allStudents
     .filter((s) => !connectedStudentIds.has(s.id))
     .map((s) => ({ id: s.id, roll_no: s.roll_no, name: s.name }));
-
-  const violations_count = enrichedDevices.filter((d) => d.compliance_status === 'violation_active' || d.compliance_status === 'unregistered_active').length;
-  const compliant_count = enrichedDevices.filter((d) => d.compliance_status === 'compliant_idle').length;
-  const registered_count = enrichedDevices.filter((d) => Boolean(d.student_id)).length;
 
   return {
     enrichedDevices,
     activeSchedule,
     compliance_summary: {
       total_connected: enrichedDevices.length,
-      registered_count,
-      violations_count,
-      compliant_count,
-      unregistered_count: enrichedDevices.length - registered_count,
+      registered_count: enrichedDevices.filter((d) => Boolean(d.student_id)).length,
+      violations_count: enrichedDevices.filter(
+        (d) => d.compliance_status === 'violation_active' || d.compliance_status === 'unregistered_active'
+      ).length,
+      compliant_count: enrichedDevices.filter((d) => d.compliance_status === 'compliant_idle').length,
+      unregistered_count: enrichedDevices.filter((d) => !d.student_id).length,
       absent_students,
     },
   };
 }
 
+// GET — poll ESP32 if no recent push data, then enrich and return
 export async function GET() {
   const now = Date.now();
-  let isAlive = latestEsp32Data.last_received_at! > 0 && (now - latestEsp32Data.last_received_at!) < 8000;
+  const staleMs = 6000;
+  const isAliveFromPush =
+    latestEsp32Data.last_received_at! > 0 && now - latestEsp32Data.last_received_at! < staleMs;
 
-  // Fallback Polling: If no push telemetry received recently, query ESP32 directly
+  let isAlive = isAliveFromPush;
   if (!isAlive) {
-    const currentConfigIp = getTargetEsp32Ip();
-    const candidateUrls = [
-      `http://${currentConfigIp}/api/status`,
-      'http://192.168.4.1/api/status',
-      'http://10.38.17.251/api/status',
-    ];
-
-    for (const url of candidateUrls) {
-      try {
-        const res = await fetch(url, {
-          signal: AbortSignal.timeout(600),
-          cache: 'no-store',
-        });
-        if (res.ok) {
-          const directData = await res.json();
-          if (directData.sta_ip && directData.sta_ip !== '0.0.0.0') {
-            setTargetEsp32Ip(directData.sta_ip);
-          }
-          latestEsp32Data = {
-            connected_count: Number(directData.connected_count) || 0,
-            internet_allowed: directData.internet_allowed !== undefined ? Boolean(directData.internet_allowed) : true,
-            routing_status: directData.routing_status === 'active' ? 'active' : 'unavailable',
-            ap_ssid: directData.ap_ssid || 'PBL-MC',
-            ap_ip: directData.ap_ip || '192.168.4.1',
-            sta_ssid: directData.sta_ssid || 'VoiDX',
-            sta_status: directData.sta_status || 'connected',
-            sta_ip: directData.sta_ip || currentConfigIp,
-            channel: Number(directData.channel) || 6,
-            uptime_secs: Number(directData.uptime_secs) || 0,
-            devices: Array.isArray(directData.devices) ? directData.devices : [],
-            last_received_at: Date.now(),
-          };
-          isAlive = true;
-          break;
-        }
-      } catch {
-        // Try next candidate
-      }
-    }
+    isAlive = await fetchFromEsp32();
   }
 
-  // Enrich with student identity and real-time class compliance
-  const { enrichedDevices, activeSchedule, compliance_summary } = await enrichDevicesWithIdentityAndCompliance(latestEsp32Data.devices || []);
+  const { enrichedDevices, activeSchedule, compliance_summary } = await enrichDevices(
+    latestEsp32Data.devices || []
+  );
 
   return NextResponse.json(
     {
@@ -152,6 +162,7 @@ export async function GET() {
       is_alive: isAlive,
       active_schedule: activeSchedule,
       compliance_summary,
+      esp32_ip: getTargetEsp32Ip(),
     },
     {
       headers: {
@@ -162,17 +173,23 @@ export async function GET() {
   );
 }
 
+// POST — receive push telemetry from ESP32
 export async function POST(req: NextRequest) {
   try {
     const payload = await req.json();
+
+    // Auto-update target IP from incoming STA IP
+    if (payload.sta_ip && payload.sta_ip !== '0.0.0.0') {
+      setTargetEsp32Ip(payload.sta_ip);
+    }
 
     latestEsp32Data = {
       connected_count: Number(payload.connected_count) || 0,
       internet_allowed: payload.internet_allowed !== undefined ? Boolean(payload.internet_allowed) : true,
       routing_status: payload.routing_status === 'active' ? 'active' : 'unavailable',
       ap_ssid: payload.ap_ssid || 'PBL-MC',
-      ap_ip: payload.ap_ip || '192.168.4.1',
-      sta_ssid: payload.sta_ssid || 'Hostel_Guest',
+      ap_ip: payload.ap_ip || '192.168.199.1',
+      sta_ssid: payload.sta_ssid || 'VoiDX',
       sta_status: payload.sta_status || 'connected',
       sta_ip: payload.sta_ip || '0.0.0.0',
       channel: Number(payload.channel) || 6,

@@ -1,113 +1,67 @@
 import { StudentRecord, ClassScheduleInfo } from '@/types/occupancy';
 
-// Supabase environment variables
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 export const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
-// In-Memory Fallback Store (Initialized with realistic demo data)
-let mockStudents: StudentRecord[] = [
-  {
-    id: 'a0000000-0000-0000-0000-000000000001',
-    roll_no: 'CS2026-001',
-    name: 'Aditya Sharma',
-    email: 'aditya@example.edu',
-    department: 'Computer Science',
-    devices: [
-      { id: 'dev-1', mac_address: 'A4:C1:38:12:34:56', device_name: 'iPhone 14', is_primary: true },
-      { id: 'dev-2', mac_address: '7C:2E:BD:98:76:54', device_name: 'iPad Air', is_primary: false },
-    ],
-  },
-  {
-    id: 'a0000000-0000-0000-0000-000000000002',
-    roll_no: 'CS2026-002',
-    name: 'Rahul Nair',
-    email: 'rahul@example.edu',
-    department: 'Computer Science',
-    devices: [
-      { id: 'dev-3', mac_address: '58:D9:C3:44:55:66', device_name: 'Galaxy S23', is_primary: true },
-    ],
-  },
-  {
-    id: 'a0000000-0000-0000-0000-000000000003',
-    roll_no: 'CS2026-003',
-    name: 'Sneha Patel',
-    email: 'sneha@example.edu',
-    department: 'Information Technology',
-    devices: [
-      { id: 'dev-4', mac_address: 'BC:D0:74:11:22:33', device_name: 'OnePlus 11', is_primary: true },
-    ],
-  },
-  {
-    id: 'a0000000-0000-0000-0000-000000000004',
-    roll_no: 'CS2026-004',
-    name: 'Vikram Singh',
-    email: 'vikram@example.edu',
-    department: 'Computer Science',
-    devices: [
-      { id: 'dev-5', mac_address: '34:E6:D7:AA:BB:CC', device_name: 'Pixel 8 Pro', is_primary: true },
-    ],
-  },
-  {
-    id: 'a0000000-0000-0000-0000-000000000005',
-    roll_no: 'CS2026-005',
-    name: 'Ananya Roy',
-    email: 'ananya@example.edu',
-    department: 'Electronics',
-    devices: [],
-  },
-];
+const HEADERS: Record<string, string> = {
+  apikey: SUPABASE_ANON_KEY,
+  Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+  'Content-Type': 'application/json',
+};
 
-let mockSchedules: ClassScheduleInfo[] = [
-  {
-    id: 'sch-1',
-    subject_code: 'CS301',
-    subject_name: 'Computer Networks & IoT',
-    classroom: 'Lab 304',
-    start_time: '08:00',
-    end_time: '18:00', // Set wide for immediate demonstration
-    is_active: true,
-    in_session: true,
-  },
-];
-
+// ---------------------------------------------------------------------------
+// Students — reads directly from Supabase, no mock fallback
+// ---------------------------------------------------------------------------
 export async function getStudents(): Promise<StudentRecord[]> {
-  if (isSupabaseConfigured) {
-    try {
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/students?select=id,roll_no,name,email,department,student_devices(*)`, {
-        headers: {
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        },
-        cache: 'no-store',
-      });
-      if (res.ok) {
-        const data = await res.json();
-        return data.map((s: any) => ({
-          ...s,
-          devices: s.student_devices || [],
-        }));
-      }
-    } catch (e) {
-      console.error('Failed to query Supabase students, falling back to mock:', e);
-    }
+  if (!isSupabaseConfigured) return [];
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/students?select=id,roll_no,name,email,department,student_devices(id,mac_address,device_name,is_primary,last_seen_at)`,
+    { headers: HEADERS, cache: 'no-store' }
+  );
+  if (!res.ok) {
+    console.error('getStudents failed:', res.status, await res.text());
+    return [];
   }
-  return mockStudents;
+  const data = await res.json();
+  return data.map((s: any) => ({
+    ...s,
+    devices: s.student_devices || [],
+  }));
 }
 
-export async function findStudentByMac(mac: string): Promise<{ student: StudentRecord; device_name: string } | null> {
-  const normMac = mac.trim().toLowerCase();
-  const students = await getStudents();
-
-  for (const student of students) {
-    for (const dev of student.devices) {
-      if (dev.mac_address.toLowerCase() === normMac) {
-        return { student, device_name: dev.device_name };
-      }
-    }
-  }
-  return null;
+// Targeted lookup — queries student_devices table directly by MAC
+export async function findStudentByMac(
+  mac: string
+): Promise<{ student: StudentRecord; device_name: string } | null> {
+  if (!isSupabaseConfigured || !mac) return null;
+  const normMac = mac.trim().toUpperCase();
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/student_devices?mac_address=eq.${encodeURIComponent(normMac)}&select=id,mac_address,device_name,is_primary,student_id,students(id,roll_no,name,email,department)`,
+    { headers: HEADERS, cache: 'no-store' }
+  );
+  if (!res.ok) return null;
+  const rows = await res.json();
+  if (!rows?.length) return null;
+  const row = rows[0];
+  if (!row.students) return null;
+  const student: StudentRecord = {
+    id: row.students.id,
+    roll_no: row.students.roll_no,
+    name: row.students.name,
+    email: row.students.email,
+    department: row.students.department,
+    devices: [
+      {
+        id: row.id,
+        mac_address: row.mac_address,
+        device_name: row.device_name,
+        is_primary: row.is_primary,
+      },
+    ],
+  };
+  return { student, device_name: row.device_name };
 }
 
 export async function registerDeviceToStudent(params: {
@@ -117,127 +71,98 @@ export async function registerDeviceToStudent(params: {
   device_name?: string;
   department?: string;
 }) {
+  if (!isSupabaseConfigured) throw new Error('Supabase not configured');
+
   const normMac = params.mac_address.trim().toUpperCase();
 
-  if (isSupabaseConfigured) {
-    try {
-      // 1. Find or create student
-      let studentRes = await fetch(`${SUPABASE_URL}/rest/v1/students?roll_no=eq.${encodeURIComponent(params.student_roll)}`, {
-        headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
-      });
-      let studentList = await studentRes.json();
-      let studentId = studentList?.[0]?.id;
+  // 1. Find or create student by roll_no
+  const studentRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/students?roll_no=eq.${encodeURIComponent(params.student_roll)}&select=id`,
+    { headers: HEADERS }
+  );
+  const studentList = await studentRes.json();
+  let studentId: string | undefined = studentList?.[0]?.id;
 
-      if (!studentId && params.student_name) {
-        const createRes = await fetch(`${SUPABASE_URL}/rest/v1/students`, {
-          method: 'POST',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-            'Content-Type': 'application/json',
-            Prefer: 'return=representation',
-          },
-          body: JSON.stringify({
-            roll_no: params.student_roll,
-            name: params.student_name,
-            department: params.department || 'General',
-          }),
-        });
-        const created = await createRes.json();
-        studentId = created?.[0]?.id;
-      }
-
-      if (studentId) {
-        // Upsert device
-        await fetch(`${SUPABASE_URL}/rest/v1/student_devices`, {
-          method: 'POST',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-            'Content-Type': 'application/json',
-            Prefer: 'resolution=merge-duplicates',
-          },
-          body: JSON.stringify({
-            student_id: studentId,
-            mac_address: normMac,
-            device_name: params.device_name || 'Smartphone',
-            last_seen_at: new Date().toISOString(),
-          }),
-        });
-        return { success: true };
-      }
-    } catch (e) {
-      console.error('Supabase device registration failed, updating in-memory:', e);
-    }
+  if (!studentId) {
+    if (!params.student_name) throw new Error('student_name required to create new student');
+    const createRes = await fetch(`${SUPABASE_URL}/rest/v1/students`, {
+      method: 'POST',
+      headers: { ...HEADERS, Prefer: 'return=representation' },
+      body: JSON.stringify({
+        roll_no: params.student_roll,
+        name: params.student_name,
+        department: params.department || 'General',
+      }),
+    });
+    if (!createRes.ok) throw new Error(`Failed to create student: ${createRes.status}`);
+    const created = await createRes.json();
+    studentId = created?.[0]?.id;
   }
 
-  // In-Memory Fallback Update
-  let student = mockStudents.find((s) => s.roll_no.toLowerCase() === params.student_roll.trim().toLowerCase());
-  if (!student && params.student_name) {
-    student = {
-      id: `std-${Date.now()}`,
-      roll_no: params.student_roll,
-      name: params.student_name,
-      department: params.department || 'General',
-      devices: [],
-    };
-    mockStudents.push(student);
-  }
+  if (!studentId) throw new Error('Could not resolve student ID');
 
-  if (student) {
-    const existingDev = student.devices.find((d) => d.mac_address.toLowerCase() === normMac.toLowerCase());
-    if (existingDev) {
-      existingDev.device_name = params.device_name || existingDev.device_name;
-    } else {
-      student.devices.push({
-        id: `dev-${Date.now()}`,
-        mac_address: normMac,
-        device_name: params.device_name || 'Personal Phone',
-        is_primary: student.devices.length === 0,
-        last_seen_at: new Date().toISOString(),
-      });
-    }
-    return { success: true, student };
-  }
+  // 2. Upsert device
+  const devRes = await fetch(`${SUPABASE_URL}/rest/v1/student_devices`, {
+    method: 'POST',
+    headers: { ...HEADERS, Prefer: 'resolution=merge-duplicates,return=representation' },
+    body: JSON.stringify({
+      student_id: studentId,
+      mac_address: normMac,
+      device_name: params.device_name || 'Smartphone',
+      last_seen_at: new Date().toISOString(),
+    }),
+  });
+  if (!devRes.ok) throw new Error(`Failed to register device: ${devRes.status}`);
 
-  throw new Error('Student not found and no name provided to create');
+  return { success: true };
 }
 
+// ---------------------------------------------------------------------------
+// Class Schedules — with real day-of-week check
+// ---------------------------------------------------------------------------
 export async function getClassSchedules(): Promise<ClassScheduleInfo[]> {
-  if (isSupabaseConfigured) {
-    try {
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/class_schedules?is_active=eq.true`, {
-        headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
-        cache: 'no-store',
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const now = new Date();
-        const curTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-        return data.map((sch: any) => ({
-          ...sch,
-          in_session: sch.start_time <= curTime && sch.end_time >= curTime,
-        }));
-      }
-    } catch (e) {
-      console.error('Failed to query Supabase schedules:', e);
-    }
-  }
+  if (!isSupabaseConfigured) return [];
+
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/class_schedules?is_active=eq.true`,
+    { headers: HEADERS, cache: 'no-store' }
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
 
   const now = new Date();
+  const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
   const curTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-  return mockSchedules.map((sch) => ({
-    ...sch,
-    in_session: sch.start_time <= curTime && sch.end_time >= curTime,
-  }));
+
+  return data.map((sch: any) => {
+    const start = (sch.start_time ?? '00:00').slice(0, 5);
+    const end = (sch.end_time ?? '23:59').slice(0, 5);
+    const daysOk = Array.isArray(sch.days_of_week)
+      ? sch.days_of_week.includes(dayOfWeek)
+      : true; // if no days set, assume always active
+    return {
+      id: sch.id,
+      subject_code: sch.subject_code,
+      subject_name: sch.subject_name,
+      classroom: sch.classroom,
+      start_time: start,
+      end_time: end,
+      days_of_week: sch.days_of_week ?? [],
+      is_active: sch.is_active,
+      in_session: daysOk && start <= curTime && end >= curTime,
+    };
+  });
 }
 
-export async function updateClassSchedule(schedule: ClassScheduleInfo) {
-  const idx = mockSchedules.findIndex((s) => s.id === schedule.id);
-  if (idx !== -1) {
-    mockSchedules[idx] = schedule;
-  } else {
-    mockSchedules.push(schedule);
-  }
-  return schedule;
+export async function updateClassSchedule(
+  schedule: Partial<ClassScheduleInfo> & { id: string }
+) {
+  if (!isSupabaseConfigured) throw new Error('Supabase not configured');
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/class_schedules?id=eq.${schedule.id}`, {
+    method: 'PATCH',
+    headers: { ...HEADERS, Prefer: 'return=representation' },
+    body: JSON.stringify(schedule),
+  });
+  if (!res.ok) throw new Error(`updateClassSchedule failed: ${res.status}`);
+  return res.json();
 }

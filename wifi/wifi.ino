@@ -1,13 +1,13 @@
 /*
  * ============================================================================
- * Project: ESP32 WiFi NAT Router & Classroom Monitor
- * ============================================================================
- * Traffic counting:
- *   - Promiscuous mode sniffer on AP interface captures real 802.11 DATA frames
- *   - Per-client actual byte counters for TX (upload) and RX (download)
- *   - RSSI from esp_wifi_ap_get_sta_list() — hardware value
- *   - DNS interception gives real query count and last requested domain
- *   - rate_bps calculated from bytes delta over time window
+ * Project: ESP32 WiFi NAT Router, Classroom Policy Monitor & STM32 Bridge
+ * Target : ESP32 (NodeMCU / DOIT DevKit V1)
+ * 
+ * Hardware Connections to STM32 Blue Pill:
+ * ----------------------------------------------------------------------------
+ *   ESP32 GPIO17 (TX2) ---> STM32 PA10 (USART1 RX)
+ *   ESP32 GPIO16 (RX2) <--- STM32 PA9  (USART1 TX) [Optional]
+ *   ESP32 GND          <---> STM32 GND              [Mandatory Common Ground!]
  * ============================================================================
  */
 
@@ -29,15 +29,31 @@ static const char* AP_PASS    = "12345678";
 IPAddress apIP(192, 168, 199, 1);
 IPAddress netMask(255, 255, 255, 0);
 
-// Dashboard push target (optional best-effort)
 static String  dashboard_host = "";
 static int     dashboard_port = 3000;
 static const char* DASHBOARD_PATH = "/api/esp32";
 #define PUSH_INTERVAL_MS 2000
 
 // ----------------------------------------------------------------------------
-// DNS Proxy
+// STM32 Bridge (Hardware Serial2 on GPIO16-RX, GPIO17-TX)
 // ----------------------------------------------------------------------------
+#define STM32_RX_PIN 16
+#define STM32_TX_PIN 17
+HardwareSerial STMSerial(2);
+
+// ----------------------------------------------------------------------------
+// Classroom Policy & Camera State
+// ----------------------------------------------------------------------------
+int  latestPersonCount = 0;
+bool classInSession    = true;
+bool anyHighUsage      = false;
+String schedStartTime  = "08:00";
+String schedEndTime    = "18:00";
+unsigned long lastStmBroadcastMs = 0;
+
+#define HIGH_USAGE_RATE_THRESHOLD  200000 // bits/sec (25 KB/s)
+#define HIGH_USAGE_BYTE_THRESHOLD  300000 // bytes total
+
 WiFiUDP dnsServer;
 WiFiUDP dnsUpstream;
 const uint16_t DNS_PORT = 53;
@@ -45,17 +61,11 @@ IPAddress publicDns(8, 8, 8, 8);
 
 WebServer server(80);
 
-// ----------------------------------------------------------------------------
-// State
-// ----------------------------------------------------------------------------
 bool    internetAllowed  = true;
 bool    naptActive       = false;
 uint8_t lastStationCount = 255;
 uint32_t last_push_ms    = 0;
 
-// ----------------------------------------------------------------------------
-// Per-client tracking
-// ----------------------------------------------------------------------------
 const int MAX_CLIENTS = 16;
 
 struct ClientInfo {
@@ -63,28 +73,23 @@ struct ClientInfo {
   uint8_t   mac[6];
   char      mac_str[18];
   IPAddress ip;
-  int8_t    rssi;              // real RSSI from hardware
+  int8_t    rssi;
   char      lastDomain[80];
   uint32_t  dnsQueries;
-  // Real traffic bytes (from promiscuous sniffer)
-  uint32_t  txBytes;           // data sent FROM this client (upload)
-  uint32_t  rxBytes;           // data sent TO this client (download)
+  uint32_t  txBytes;
+  uint32_t  rxBytes;
   uint32_t  txPkts;
   uint32_t  rxPkts;
-  // Rate calculation
   uint32_t  lastRateTxBytes;
   uint32_t  lastRateRxBytes;
   uint32_t  lastRateMs;
-  uint32_t  rateBps;           // real calculated bps
+  uint32_t  rateBps;
   uint32_t  lastActiveMs;
 };
 
 ClientInfo clients[MAX_CLIENTS];
 portMUX_TYPE clientMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ----------------------------------------------------------------------------
-// Helper: Format MAC
-// ----------------------------------------------------------------------------
 static void formatMac(const uint8_t* mac, char* out) {
   snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -116,19 +121,15 @@ static int findOrCreateClient(const uint8_t* mac) {
       return i;
     }
   }
-  return -1; // table full
+  return -1;
 }
 
-// ----------------------------------------------------------------------------
-// 802.11 Promiscuous Sniffer — counts real per-client bytes
-// Frame layout: https://en.wikipedia.org/wiki/802.11_frame_types
-// ----------------------------------------------------------------------------
 typedef struct {
   uint16_t frame_ctrl;
   uint16_t duration;
-  uint8_t  addr1[6]; // Destination (receiver)
-  uint8_t  addr2[6]; // Source (transmitter)
-  uint8_t  addr3[6]; // BSSID or other
+  uint8_t  addr1[6];
+  uint8_t  addr2[6];
+  uint8_t  addr3[6];
 } wifi_ieee80211_mac_hdr_t;
 
 static void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -138,21 +139,15 @@ static void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t
   wifi_ieee80211_mac_hdr_t* hdr = (wifi_ieee80211_mac_hdr_t*)pkt->payload;
   uint16_t fc = hdr->frame_ctrl;
 
-  // Frame control bits: ToDS (bit 8), FromDS (bit 9)
   bool toDS   = (fc >> 8) & 0x01;
   bool fromDS = (fc >> 8) & 0x02;
 
-  // AP SoftAP BSSID — our AP MAC
-  // ToDS=1, FromDS=0 → client uploading to AP (addr2 = client MAC)
-  // ToDS=0, FromDS=1 → AP sending to client (addr1 = client MAC)
-
   uint16_t dataLen = pkt->rx_ctrl.sig_len;
-  if (dataLen < 24) return; // minimum 802.11 MAC header
+  if (dataLen < 24) return;
 
   portENTER_CRITICAL_ISR(&clientMux);
 
   if (toDS && !fromDS) {
-    // Upload: client (addr2) → AP
     int idx = findClientByMac(hdr->addr2);
     if (idx >= 0) {
       clients[idx].txBytes += dataLen;
@@ -160,7 +155,6 @@ static void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t
       clients[idx].lastActiveMs = millis();
     }
   } else if (!toDS && fromDS) {
-    // Download: AP → client (addr1)
     int idx = findClientByMac(hdr->addr1);
     if (idx >= 0) {
       clients[idx].rxBytes += dataLen;
@@ -171,23 +165,19 @@ static void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t
   portEXIT_CRITICAL_ISR(&clientMux);
 }
 
-// ----------------------------------------------------------------------------
-// Sync hardware station list + RSSI
-// ----------------------------------------------------------------------------
 static void syncStations() {
   wifi_sta_list_t sta_list;
   if (esp_wifi_ap_get_sta_list(&sta_list) != ESP_OK) return;
 
   unsigned long now = millis();
 
-  // Mark gone
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (!clients[i].active) continue;
     bool found = false;
     for (int j = 0; j < sta_list.num; j++) {
       if (memcmp(clients[i].mac, sta_list.sta[j].mac, 6) == 0) {
         found = true;
-        clients[i].rssi = sta_list.sta[j].rssi; // real RSSI
+        clients[i].rssi = sta_list.sta[j].rssi;
         break;
       }
     }
@@ -197,7 +187,6 @@ static void syncStations() {
     }
   }
 
-  // Add new
   for (int j = 0; j < sta_list.num; j++) {
     const uint8_t* mac = sta_list.sta[j].mac;
     int idx = findOrCreateClient(mac);
@@ -207,28 +196,49 @@ static void syncStations() {
   }
 }
 
-// ----------------------------------------------------------------------------
-// Update per-client rate_bps (called every ~1s)
-// ----------------------------------------------------------------------------
 static void updateRates() {
   unsigned long now = millis();
+  anyHighUsage = false;
+
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (!clients[i].active) continue;
     uint32_t dt = now - clients[i].lastRateMs;
     if (dt >= 1000) {
       uint32_t bytesDelta = (clients[i].txBytes + clients[i].rxBytes)
                           - (clients[i].lastRateTxBytes + clients[i].lastRateRxBytes);
-      clients[i].rateBps = (bytesDelta * 8 * 1000) / dt; // bits per second
+      clients[i].rateBps = (bytesDelta * 8 * 1000) / dt;
       clients[i].lastRateTxBytes = clients[i].txBytes;
       clients[i].lastRateRxBytes = clients[i].rxBytes;
       clients[i].lastRateMs = now;
     }
+
+    if (clients[i].rateBps > HIGH_USAGE_RATE_THRESHOLD ||
+        (clients[i].txBytes + clients[i].rxBytes) > HIGH_USAGE_BYTE_THRESHOLD) {
+      anyHighUsage = true;
+    }
   }
 }
 
-// ----------------------------------------------------------------------------
-// DNS Proxy — real DNS packet interception
-// ----------------------------------------------------------------------------
+void broadcastToSTM32() {
+  uint8_t phoneCount = WiFi.softAPgetStationNum();
+
+  char telemMsg[128];
+  snprintf(telemMsg, sizeof(telemMsg),
+           "$TELEM,P:%d,M:%d,S:%d,H:%d,T1:%s,T2:%s*\n",
+           latestPersonCount,
+           phoneCount,
+           classInSession ? 1 : 0,
+           anyHighUsage ? 1 : 0,
+           schedStartTime.c_str(),
+           schedEndTime.c_str());
+
+  STMSerial.print(telemMsg);
+  static uint8_t logCounter = 0;
+  if (++logCounter % 5 == 0) {
+    Serial.printf("[STM32 TX] %s", telemMsg);
+  }
+}
+
 String parseDnsDomain(const uint8_t* buf, int len) {
   if (len < 13) return "Unknown";
   String domain;
@@ -253,7 +263,6 @@ void recordDnsActivity(IPAddress clientIP, const String& domain) {
       return;
     }
   }
-  // Assign IP to first slot with unassigned IP
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (clients[i].active && clients[i].ip == IPAddress(0, 0, 0, 0)) {
       clients[i].ip = clientIP;
@@ -279,7 +288,6 @@ void processDnsProxy() {
   String domain = parseDnsDomain(buf, bytesRead);
   recordDnsActivity(clientIP, domain);
 
-  // Forward to upstream DNS
   dnsUpstream.beginPacket(publicDns, DNS_PORT);
   dnsUpstream.write(buf, bytesRead);
   dnsUpstream.endPacket();
@@ -300,9 +308,6 @@ void processDnsProxy() {
   }
 }
 
-// ----------------------------------------------------------------------------
-// Build Status JSON
-// ----------------------------------------------------------------------------
 String buildStatusJson() {
   syncStations();
   updateRates();
@@ -311,6 +316,11 @@ String buildStatusJson() {
 
   String j = "{";
   j += "\"connected_count\":" + String(count) + ",";
+  j += "\"person_count\":" + String(latestPersonCount) + ",";
+  j += "\"high_usage\":" + String(anyHighUsage ? "true" : "false") + ",";
+  j += "\"class_in_session\":" + String(classInSession ? "true" : "false") + ",";
+  j += "\"start_time\":\"" + schedStartTime + "\",";
+  j += "\"end_time\":\"" + schedEndTime + "\",";
   j += "\"internet_allowed\":" + String(internetAllowed ? "true" : "false") + ",";
   j += "\"routing_status\":\"" + String(naptActive ? "active" : "unavailable") + "\",";
   j += "\"ap_ssid\":\"" + String(AP_SSID) + "\",";
@@ -338,7 +348,6 @@ String buildStatusJson() {
     j += "\"rssi\":" + String(clients[i].rssi) + ",";
     j += "\"last_domain\":\"" + String(clients[i].lastDomain) + "\",";
     j += "\"dns_queries\":" + String(clients[i].dnsQueries) + ",";
-    // Real traffic from promiscuous sniffer
     j += "\"up_bytes\":" + String(clients[i].txBytes) + ",";
     j += "\"down_bytes\":" + String(clients[i].rxBytes) + ",";
     j += "\"up_pkts\":" + String(clients[i].txPkts) + ",";
@@ -352,9 +361,6 @@ String buildStatusJson() {
   return j;
 }
 
-// ----------------------------------------------------------------------------
-// REST API
-// ----------------------------------------------------------------------------
 void sendCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -379,6 +385,46 @@ void handleToggle() {
   server.send(200, "application/json", buildStatusJson());
 }
 
+void handlePersonCount() {
+  if (server.hasArg("count")) {
+    latestPersonCount = server.arg("count").toInt();
+    Serial.printf("[CAM] Person count updated: %d\n", latestPersonCount);
+  } else if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    int idx = body.indexOf("\"personCount\":");
+    if (idx != -1) {
+      latestPersonCount = body.substring(idx + 14).toInt();
+    }
+  }
+  broadcastToSTM32();
+  sendCorsHeaders();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"person_count\":" + String(latestPersonCount) + "}");
+}
+
+void handleSchedule() {
+  if (server.hasArg("start_time")) schedStartTime = server.arg("start_time");
+  if (server.hasArg("end_time"))   schedEndTime   = server.arg("end_time");
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    int i1 = body.indexOf("\"start_time\":");
+    if (i1 != -1) {
+      int q1 = body.indexOf("\"", i1 + 13);
+      int q2 = body.indexOf("\"", q1 + 1);
+      if (q1 != -1 && q2 != -1) schedStartTime = body.substring(q1 + 1, q2);
+    }
+    int i2 = body.indexOf("\"end_time\":");
+    if (i2 != -1) {
+      int q1 = body.indexOf("\"", i2 + 11);
+      int q2 = body.indexOf("\"", q1 + 1);
+      if (q1 != -1 && q2 != -1) schedEndTime = body.substring(q1 + 1, q2);
+    }
+  }
+  Serial.printf("[SCHED] Timings set to %s - %s\n", schedStartTime.c_str(), schedEndTime.c_str());
+  broadcastToSTM32();
+  sendCorsHeaders();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"start\":\"" + schedStartTime + "\",\"end\":\"" + schedEndTime + "\"}");
+}
+
 void handleConfig() {
   if (server.hasArg("host")) dashboard_host = server.arg("host");
   if (server.hasArg("port")) dashboard_port = server.arg("port").toInt();
@@ -392,9 +438,6 @@ void handleOptions() {
   server.send(204);
 }
 
-// ----------------------------------------------------------------------------
-// Best-effort push (non-blocking)
-// ----------------------------------------------------------------------------
 void pushTelemetry() {
   if (WiFi.status() != WL_CONNECTED || dashboard_host.length() == 0) return;
   WiFiClient httpClient;
@@ -408,15 +451,15 @@ void pushTelemetry() {
   http.end();
 }
 
-// ----------------------------------------------------------------------------
-// Setup
-// ----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n==================================================");
-  Serial.println("  ESP32 WiFi NAT Router & Classroom Monitor");
+  Serial.println("  ESP32 WiFi NAT Router, Policy Node & STM32 Bridge");
   Serial.println("==================================================");
+
+  STMSerial.begin(115200, SERIAL_8N1, STM32_RX_PIN, STM32_TX_PIN);
+  Serial.printf("[STM32 LINK] Serial2 initialized on TX2: GPIO%d, RX2: GPIO%d @ 115200\n", STM32_TX_PIN, STM32_RX_PIN);
 
   memset(clients, 0, sizeof(clients));
 
@@ -428,7 +471,6 @@ void setup() {
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.printf("[AP] SSID: %s | GW: %s\n", AP_SSID, apIP.toString().c_str());
 
-  // Enable promiscuous mode for real traffic counting
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(promiscuousCallback);
   Serial.println("[SNIFFER] Promiscuous traffic counters active");
@@ -437,23 +479,24 @@ void setup() {
   Serial.println("[DNS] Transparent proxy on port 53");
 
   server.enableCORS(true);
-  server.on("/api/status", HTTP_GET,     handleStatus);
-  server.on("/api/status", HTTP_OPTIONS, handleOptions);
-  server.on("/api/toggle", HTTP_POST,    handleToggle);
-  server.on("/api/toggle", HTTP_GET,     handleToggle);
-  server.on("/api/toggle", HTTP_OPTIONS, handleOptions);
-  server.on("/api/config", HTTP_POST,    handleConfig);
-  server.on("/api/config", HTTP_GET,     handleConfig);
+  server.on("/api/status",   HTTP_GET,     handleStatus);
+  server.on("/api/status",   HTTP_OPTIONS, handleOptions);
+  server.on("/api/toggle",   HTTP_POST,    handleToggle);
+  server.on("/api/toggle",   HTTP_GET,     handleToggle);
+  server.on("/api/toggle",   HTTP_OPTIONS, handleOptions);
+  server.on("/api/person",   HTTP_POST,    handlePersonCount);
+  server.on("/api/person",   HTTP_GET,     handlePersonCount);
+  server.on("/api/schedule", HTTP_POST,    handleSchedule);
+  server.on("/api/schedule", HTTP_GET,     handleSchedule);
+  server.on("/api/config",   HTTP_POST,    handleConfig);
+  server.on("/api/config",   HTTP_GET,     handleConfig);
   server.begin();
-  Serial.println("[HTTP] REST API on port 80");
+  Serial.println("[HTTP] REST API on port 80 ready for Web & Camera");
 
   WiFi.begin(ROUTER_SSID, ROUTER_PASS);
   Serial.printf("[STA] Connecting to '%s'...\n", ROUTER_SSID);
 }
 
-// ----------------------------------------------------------------------------
-// Loop
-// ----------------------------------------------------------------------------
 static uint32_t lastRateUpdate = 0;
 
 void loop() {
@@ -479,13 +522,18 @@ void loop() {
     lastStationCount = cnt;
     Serial.printf("[AP] Stations: %d\n", cnt);
     syncStations();
+    broadcastToSTM32();
   }
 
-  // Update rate counters every second
   uint32_t now = millis();
   if (now - lastRateUpdate >= 1000) {
     lastRateUpdate = now;
     updateRates();
+  }
+
+  if (now - lastStmBroadcastMs >= 800) {
+    lastStmBroadcastMs = now;
+    broadcastToSTM32();
   }
 
   if (now - last_push_ms >= PUSH_INTERVAL_MS) {

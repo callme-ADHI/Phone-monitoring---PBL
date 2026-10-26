@@ -12,6 +12,8 @@ import threading
 import time
 
 import cv2
+import numpy as np
+import requests
 from ultralytics import YOLO
 
 MODEL_FILE       = "yolov8n.pt"
@@ -53,6 +55,32 @@ class WebcamSource:
 
     def release(self) -> None:
         self._cap.release()
+
+
+class ESP32CamSource:
+    """Pulls single JPEG frames from an ESP32-CAM's /capture endpoint.
+    Used instead of a local webcam once the camera module is working."""
+
+    def __init__(self, base_url: str, timeout: float = 4.0):
+        self._base = base_url.rstrip("/")
+        self._timeout = timeout
+        self._session = requests.Session()
+        # fail fast if the camera isn't reachable at all
+        self.read()
+
+    def read(self) -> tuple[bool, "cv2.typing.MatLike | None"]:
+        try:
+            r = self._session.get(f"{self._base}/capture", timeout=self._timeout)
+            r.raise_for_status()
+            frame = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                return False, None
+            return True, frame
+        except requests.RequestException:
+            return False, None
+
+    def release(self) -> None:
+        self._session.close()
 
 
 def detect_people(model: YOLO, frame, conf: float) -> list[dict]:
@@ -121,9 +149,14 @@ def start_api_server(port: int = 8000):
     return server
 
 
-def run(camera_index: int, conf: float, port: int) -> None:
+def run(camera_index: int, conf: float, port: int, source_kind: str, cam_url: str) -> None:
     model = YOLO(MODEL_FILE)
-    source = WebcamSource(index=camera_index)
+    if source_kind == "esp32cam":
+        print(f"Pulling frames from ESP32-CAM at {cam_url}")
+        source = ESP32CamSource(cam_url)
+    else:
+        print(f"Opening system webcam index {camera_index}")
+        source = WebcamSource(index=camera_index)
     start_api_server(port)
 
     count_history: collections.deque[int] = collections.deque(maxlen=SMOOTH_WINDOW)
@@ -136,7 +169,8 @@ def run(camera_index: int, conf: float, port: int) -> None:
         while True:
             ok, frame = source.read()
             if not ok or frame is None:
-                print("Warning: failed to read frame; skipping.")
+                print("Warning: failed to read frame; retrying.")
+                time.sleep(0.2)
                 continue
 
             detections = detect_people(model, frame, conf)
@@ -191,9 +225,14 @@ def parse_args() -> argparse.Namespace:
                    help=f"Confidence threshold 0-1 (default: {CONF_THRESHOLD}).")
     p.add_argument("--port", type=int, default=8000,
                    help="Port for the HTTP API (default: 8000).")
+    p.add_argument("--source", choices=["webcam", "esp32cam"], default="webcam",
+                   help="Frame source: system webcam (default) or ESP32-CAM.")
+    p.add_argument("--cam-url", default="http://192.168.4.1",
+                   help="Base URL of the ESP32-CAM when --source esp32cam (default: http://192.168.4.1).")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(camera_index=args.camera, conf=args.conf, port=args.port)
+    run(camera_index=args.camera, conf=args.conf, port=args.port,
+        source_kind=args.source, cam_url=args.cam_url)

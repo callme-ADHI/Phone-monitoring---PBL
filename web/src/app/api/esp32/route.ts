@@ -98,32 +98,41 @@ export async function GET() {
   const now = Date.now();
   let isAlive = latestEsp32Data.last_received_at! > 0 && (now - latestEsp32Data.last_received_at!) < 8000;
 
-  // Fallback: If no push telemetry received recently, query direct AP if on the same subnet
+  // Fallback Polling: If no push telemetry received recently, query ESP32 directly
   if (!isAlive) {
-    try {
-      const res = await fetch('http://192.168.4.1/api/status', {
-        signal: AbortSignal.timeout(400),
-        cache: 'no-store',
-      });
-      if (res.ok) {
-        const directData = await res.json();
-        latestEsp32Data = {
-          connected_count: Number(directData.connected_count) || 0,
-          routing_status: directData.routing_status === 'active' ? 'active' : 'unavailable',
-          ap_ssid: directData.ap_ssid || 'PBL-MC',
-          ap_ip: directData.ap_ip || '192.168.4.1',
-          sta_ssid: directData.sta_ssid || 'Hostel_Guest',
-          sta_status: directData.sta_status || 'connected',
-          sta_ip: directData.sta_ip || '0.0.0.0',
-          channel: Number(directData.channel) || 6,
-          uptime_secs: Number(directData.uptime_secs) || 0,
-          devices: Array.isArray(directData.devices) ? directData.devices : [],
-          last_received_at: Date.now(),
-        };
-        isAlive = true;
+    const candidateUrls = [
+      'http://10.38.17.193/api/status',
+      'http://192.168.4.1/api/status',
+    ];
+
+    for (const url of candidateUrls) {
+      try {
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(600),
+          cache: 'no-store',
+        });
+        if (res.ok) {
+          const directData = await res.json();
+          latestEsp32Data = {
+            connected_count: Number(directData.connected_count) || 0,
+            internet_allowed: directData.internet_allowed !== undefined ? Boolean(directData.internet_allowed) : true,
+            routing_status: directData.routing_status === 'active' ? 'active' : 'unavailable',
+            ap_ssid: directData.ap_ssid || 'PBL-MC',
+            ap_ip: directData.ap_ip || '192.168.4.1',
+            sta_ssid: directData.sta_ssid || 'VoiDX',
+            sta_status: directData.sta_status || 'connected',
+            sta_ip: directData.sta_ip || '10.38.17.193',
+            channel: Number(directData.channel) || 6,
+            uptime_secs: Number(directData.uptime_secs) || 0,
+            devices: Array.isArray(directData.devices) ? directData.devices : [],
+            last_received_at: Date.now(),
+          };
+          isAlive = true;
+          break;
+        }
+      } catch {
+        // Try next candidate
       }
-    } catch {
-      // AP unreachable, keep current telemetry
     }
   }
 

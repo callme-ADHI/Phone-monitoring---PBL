@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { OccupancyReading } from '@/types/occupancy';
 
 export interface CameraData {
@@ -25,6 +25,8 @@ export function useCameraData(): CameraData {
   ]);
   const [secondsSince, setSecondsSince] = useState(0);
   const [isConnected, setIsConnected] = useState(false);
+  const lastSyncedCount = useRef<number>(-1);
+  const lastSyncTime = useRef<number>(0);
 
   const fetchData = useCallback(async () => {
     try {
@@ -41,6 +43,18 @@ export function useCameraData(): CameraData {
       setCurrent(reading);
       setIsConnected(true);
       setSecondsSince(0);
+
+      // Forward person count to ESP32 whenever count changes or periodically
+      const count = reading.personCount;
+      if (count !== lastSyncedCount.current || Date.now() - lastSyncTime.current > 3000) {
+        lastSyncedCount.current = count;
+        lastSyncTime.current = Date.now();
+        fetch('/api/esp32/person', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ count }),
+        }).catch(() => {});
+      }
 
       if (Array.isArray(data.history) && data.history.length > 0) {
         setHistory(

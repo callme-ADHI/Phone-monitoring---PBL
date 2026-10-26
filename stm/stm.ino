@@ -124,19 +124,16 @@ void parseTelemetry(char* line) {
 
 void updateIndicators() {
   unsigned long now = millis();
-  bool isLinkAlive = (now - lastPacketMs < 5000);
+  bool isLinkAlive = (now - lastPacketMs < 4000);
 
-  // Mismatch logic: more phones than people or distinct count difference
-  bool isMismatch = (phoneCount != personCount) || (phoneCount > personCount);
-
-  // Fast blink toggle every 300ms
-  if (now - lastBlinkMs > 300) {
+  // Fast blink toggle every 250ms for alert
+  if (now - lastBlinkMs > 250) {
     lastBlinkMs = now;
     blinkState = !blinkState;
   }
 
   if (!isLinkAlive) {
-    // Waiting for link - slow blink yellow
+    // Waiting for ESP32 link - pulse onboard and yellow LED
     digitalWrite(LED_COMPLIANT_PIN, LOW);
     digitalWrite(LED_VIOLATION_PIN, LOW);
     digitalWrite(LED_HIGH_USAGE_PIN, blinkState ? HIGH : LOW);
@@ -144,111 +141,118 @@ void updateIndicators() {
     return;
   }
 
-  // Active Policy Determination
-  if (inSession) {
-    if (highUsage) {
-      // Critical: Phone streaming/high usage during lecture! Rapid Red + Yellow blink
-      digitalWrite(LED_COMPLIANT_PIN, LOW);
-      digitalWrite(LED_VIOLATION_PIN, blinkState ? HIGH : LOW);
-      digitalWrite(LED_HIGH_USAGE_PIN, blinkState ? HIGH : LOW);
-      digitalWrite(ONBOARD_LED_PIN, blinkState ? LOW : HIGH);
-    } else if (isMismatch) {
-      // Discrepancy (e.g. phones > people, or extra devices) -> Red Blink
-      digitalWrite(LED_COMPLIANT_PIN, LOW);
-      digitalWrite(LED_VIOLATION_PIN, blinkState ? HIGH : LOW);
-      digitalWrite(LED_HIGH_USAGE_PIN, LOW);
-      digitalWrite(ONBOARD_LED_PIN, blinkState ? LOW : HIGH);
-    } else {
-      // In session and compliant
-      digitalWrite(LED_COMPLIANT_PIN, HIGH);
-      digitalWrite(LED_VIOLATION_PIN, LOW);
-      digitalWrite(LED_HIGH_USAGE_PIN, LOW);
-      digitalWrite(ONBOARD_LED_PIN, HIGH); // OFF
-    }
+  // ALERT CONDITION: Person count is greater than phone count
+  bool isAlert = (personCount > phoneCount);
+
+  if (isAlert) {
+    // Alert mode: Red violation LED blinks rapidly, Green compliant LED is OFF
+    digitalWrite(LED_COMPLIANT_PIN, LOW);
+    digitalWrite(LED_VIOLATION_PIN, blinkState ? HIGH : LOW);
+    digitalWrite(LED_HIGH_USAGE_PIN, highUsage ? (blinkState ? HIGH : LOW) : LOW);
+    digitalWrite(ONBOARD_LED_PIN, blinkState ? LOW : HIGH);
   } else {
-    // Off Hours / Recess: Green steady, high usage steady yellow if any
+    // Normal mode: Green LED is steady ON, Red violation LED is OFF
     digitalWrite(LED_COMPLIANT_PIN, HIGH);
     digitalWrite(LED_VIOLATION_PIN, LOW);
     digitalWrite(LED_HIGH_USAGE_PIN, highUsage ? HIGH : LOW);
-    digitalWrite(ONBOARD_LED_PIN, HIGH);
+    digitalWrite(ONBOARD_LED_PIN, HIGH); // OFF (inverted logic)
   }
+}
+
+void drawCenteredString(const char* buf, int xStart, int width, int y, int size) {
+  int charWidth = size * 6;
+  int textWidth = strlen(buf) * charWidth;
+  int x = xStart + (width - textWidth) / 2;
+  if (x < xStart) x = xStart;
+  display.setTextSize(size);
+  display.setCursor(x, y);
+  display.print(buf);
 }
 
 void updateOLED() {
   unsigned long now = millis();
-  bool isLinkAlive = (now - lastPacketMs < 5000);
+  bool isLinkAlive = (now - lastPacketMs < 4000);
 
   display.clearDisplay();
 
-  // Header Bar: Class Status & Window
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  if (inSession) {
-    display.print("[CLASS IN SESSION]");
-  } else {
-    display.print("[RECESS / OFF-HR]");
+  // If ESP32 link has dropped
+  if (!isLinkAlive) {
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    drawCenteredString("ESP32 LINK", 0, 128, 12, 1);
+    drawCenteredString("WAITING...", 0, 128, 28, 2);
+    drawCenteredString("Check PA10 <- TX2", 0, 128, 50, 1);
+    display.display();
+    return;
   }
 
-  display.setCursor(0, 11);
-  display.print("Time: ");
-  display.print(startTime);
-  display.print("-");
-  display.print(endTime);
+  bool isAlert = (personCount > phoneCount);
 
-  display.drawLine(0, 21, 127, 21, SSD1306_WHITE);
-
-  // Big Metrics: People vs Phones
-  display.setCursor(0, 25);
-  display.print("PEOPLE: ");
-  display.setTextSize(2);
-  display.setCursor(48, 24);
-  display.print(personCount);
-
-  display.setTextSize(1);
-  display.setCursor(76, 25);
-  display.print("PHONES:");
-  display.setTextSize(2);
-  display.setCursor(118, 24);
-  display.print(phoneCount);
-
-  display.drawLine(0, 41, 127, 41, SSD1306_WHITE);
-
-  // Footer: Mismatch & Usage Status
-  display.setTextSize(1);
-  display.setCursor(0, 45);
-
-  if (!isLinkAlive) {
-    display.print("STATUS: LINK WAITING..");
-    display.setCursor(0, 55);
-    display.print("Connect ESP32 Serial");
-  } else {
-    // Compare counts
-    if (phoneCount > personCount) {
-      display.print("ALERT: PHONE MISMATCH!");
-      display.setCursor(0, 55);
-      display.print("Phones > Persons (");
-      display.print(phoneCount - personCount);
-      display.print(" extra)");
-    } else if (personCount > phoneCount) {
-      display.print("STATUS: ");
-      display.print(personCount - phoneCount);
-      display.print(" Without Phone");
-      display.setCursor(0, 55);
-      if (highUsage) {
-        display.print("WARN: HIGH PHONE USAGE");
-      } else {
-        display.print("Policy: COMPLIANT");
-      }
+  if (isAlert) {
+    // ══════════════════════════════════════════════════════════════════════════
+    // ALERT VIEW (Only shown when Person Count > Phone Count)
+    // ══════════════════════════════════════════════════════════════════════════
+    // Top Inverted Alert Banner
+    if (blinkState) {
+      display.fillRect(0, 0, 128, 14, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     } else {
-      display.print("STATUS: EXACT MATCH (");
-      display.print(personCount);
-      display.print(")");
-      display.setCursor(0, 55);
-      if (highUsage && inSession) {
-        display.print("WARN: HIGH PHONE USAGE!");
-      } else {
-        display.print("Policy: COMPLIANT");
-      }
+      display.drawRect(0, 0, 128, 14, SSD1306_WHITE);
+      display.setTextColor(SSD1306_WHITE);
+    }
+    drawCenteredString("! ! !  ALERT  ! ! !", 0, 128, 3, 1);
+
+    display.setTextColor(SSD1306_WHITE);
+
+    // Current metrics summary
+    char countBuf[32];
+    snprintf(countBuf, sizeof(countBuf), "PERSON:%d  PHONE:%d", personCount, phoneCount);
+    drawCenteredString(countBuf, 0, 128, 18, 1);
+
+    display.drawFastHLine(8, 29, 112, SSD1306_WHITE);
+
+    // Main Alert Headline
+    display.setTextSize(2);
+    display.setCursor(8, 33);
+    display.print("PERSON>PHONE");
+
+    // Missing devices count
+    int missing = personCount - phoneCount;
+    char missBuf[32];
+    snprintf(missBuf, sizeof(missBuf), "Missing: %d Phone%s", missing, missing == 1 ? "" : "s");
+    drawCenteredString(missBuf, 0, 128, 53, 1);
+
+  } else {
+    // ══════════════════════════════════════════════════════════════════════════
+    // NORMAL VIEW (Clean, perfectly aligned 2-column display)
+    // ══════════════════════════════════════════════════════════════════════════
+    display.setTextColor(SSD1306_WHITE);
+
+    // Header: Room Monitor
+    drawCenteredString("ROOM MONITOR", 0, 128, 2, 1);
+    display.drawFastHLine(0, 12, 128, SSD1306_WHITE);
+
+    // Vertical column divider between Person (left) and Phone (right)
+    display.drawFastVLine(63, 13, 38, SSD1306_WHITE);
+
+    // Left Column: PERSON
+    drawCenteredString("PERSON", 0, 63, 16, 1);
+    char pBuf[8];
+    snprintf(pBuf, sizeof(pBuf), "%d", personCount);
+    drawCenteredString(pBuf, 0, 63, 27, 3);
+
+    // Right Column: PHONES
+    drawCenteredString("PHONES", 64, 63, 16, 1);
+    char mBuf[8];
+    snprintf(mBuf, sizeof(mBuf), "%d", phoneCount);
+    drawCenteredString(mBuf, 64, 63, 27, 3);
+
+    // Bottom Divider & Status
+    display.drawFastHLine(0, 52, 128, SSD1306_WHITE);
+
+    if (personCount == phoneCount) {
+      drawCenteredString("STATUS: EXACT MATCH", 0, 128, 55, 1);
+    } else {
+      drawCenteredString("STATUS: NORMAL", 0, 128, 55, 1);
     }
   }
 

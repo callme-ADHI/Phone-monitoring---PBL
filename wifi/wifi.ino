@@ -390,14 +390,19 @@ void handleToggle() {
 void handlePersonCount() {
   if (server.hasArg("count")) {
     latestPersonCount = server.arg("count").toInt();
-    Serial.printf("[CAM] Person count updated: %d\n", latestPersonCount);
   } else if (server.hasArg("plain")) {
     String body = server.arg("plain");
     int idx = body.indexOf("\"personCount\":");
     if (idx != -1) {
       latestPersonCount = body.substring(idx + 14).toInt();
+    } else {
+      idx = body.indexOf("\"count\":");
+      if (idx != -1) {
+        latestPersonCount = body.substring(idx + 8).toInt();
+      }
     }
   }
+  Serial.printf("[CAM->STM32] Person count received: %d\n", latestPersonCount);
   broadcastToSTM32();
   sendCorsHeaders();
   server.send(200, "application/json", "{\"status\":\"ok\",\"person_count\":" + String(latestPersonCount) + "}");

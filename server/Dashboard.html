@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local ESP32 NAT Control Center</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e2f; color: #ffffff; margin: 30px; text-align: center; }
+    .card { background: #27293d; max-width: 800px; margin: 0 auto; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+    .config-box { margin-bottom: 20px; text-align: left; background: #1e1e2f; padding: 12px; border-radius: 8px; }
+    input[type="text"] { width: 70%; padding: 8px; border-radius: 4px; border: 1px solid #444; background: #27293d; color: white; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { padding: 12px; border: 1px solid #33354a; text-align: left; }
+    th { background: #344675; color: white; }
+    .btn { padding: 12px 24px; font-size: 16px; color: white; border: none; border-radius: 6px; cursor: pointer; margin-top: 15px; }
+    .btn-on { background-color: #00f2c3; color: #1e1e2f; font-weight: bold; }
+    .btn-off { background-color: #fd5d93; font-weight: bold; }
+    .badge { padding: 6px 12px; border-radius: 20px; font-weight: bold; }
+    .badge-active { background: #00f2c3; color: #1e1e2f; }
+    .badge-paused { background: #fd5d93; color: white; }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h1>ESP32 NAT Gateway Dashboard</h1>
+  
+  <div class="config-box">
+    <label>ESP32 IP Address: </label>
+    <input type="text" id="esp32-ip" value="192.168.199.1" placeholder="192.168.199.1 or 192.168.29.15">
+    <button onclick="fetchRouterData()">Connect</button>
+  </div>
+
+  <p>Status: <span id="gateway-status" class="badge badge-active">CONNECTING...</span></p>
+  <p>Active Wi-Fi Clients: <strong id="device-count">0</strong></p>
+
+  <button id="toggle-btn" class="btn btn-off" onclick="toggleInternet()">Toggle Internet Access</button>
+
+  <h2>Active Devices Traffic Log</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Device IP</th>
+        <th>Last Requested Domain</th>
+        <th>DNS Requests</th>
+        <th>Last Activity</th>
+      </tr>
+    </thead>
+    <tbody id="device-table">
+      <tr><td colspan="4" style="text-align:center;">Loading ESP32 state...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+  function getTargetUrl(endpoint) {
+    const ip = document.getElementById('esp32-ip').value.trim();
+    return `http://${ip}${endpoint}`;
+  }
+
+  async function fetchRouterData() {
+    try {
+      const res = await fetch(getTargetUrl('/api/status'));
+      const data = await res.json();
+
+      const statusElem = document.getElementById('gateway-status');
+      statusElem.textContent = data.internet_allowed ? "INTERNET ENABLED" : "INTERNET DISABLED";
+      statusElem.className = "badge " + (data.internet_allowed ? "badge-active" : "badge-paused");
+
+      const toggleBtn = document.getElementById('toggle-btn');
+      toggleBtn.textContent = data.internet_allowed ? "Disable Internet Access" : "Enable Internet Access";
+      toggleBtn.className = "btn " + (data.internet_allowed ? "btn-off" : "btn-on");
+
+      document.getElementById('device-count').textContent = data.connected_clients || 0;
+
+      const tableBody = document.getElementById('device-table');
+      if (!data.devices || data.devices.length === 0) {
+        tableBody.innerHTML = '<tr><td colspan="4" style="text-align:center;">No client traffic recorded yet.</td></tr>';
+        return;
+      }
+
+      tableBody.innerHTML = data.devices.map(dev => `
+        <tr>
+          <td><strong>${dev.ip}</strong></td>
+          <td>${dev.last_domain}</td>
+          <td>${dev.queries}</td>
+          <td>${dev.last_active_sec}s ago</td>
+        </tr>
+      `).join('');
+
+    } catch (err) {
+      document.getElementById('gateway-status').textContent = "DISCONNECTED";
+      document.getElementById('gateway-status').className = "badge badge-paused";
+    }
+  }
+
+  async function toggleInternet() {
+    try {
+      await fetch(getTargetUrl('/api/toggle'), { method: 'POST' });
+      fetchRouterData();
+    } catch (err) {
+      console.error('Toggle request failed:', err);
+    }
+  }
+
+  // Refresh every 2 seconds
+  setInterval(fetchRouterData, 2000);
+  fetchRouterData();
+</script>
+
+</body>
+</html>

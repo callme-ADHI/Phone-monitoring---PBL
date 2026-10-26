@@ -44,12 +44,12 @@ static const IPAddress ap_leaseStart(192, 168, 4, 2);
 static const IPAddress ap_dns(8, 8, 8, 8);
 
 // Upstream WiFi settings (Internet connection from Hostel / Mobile Hotspot / Home)
-static const char* STA_SSID = "Hostel_Guest";
-static const char* STA_PASS = "";           // Leave "" if open network, or enter your WiFi password
+static const char* STA_SSID = "VoiDX";
+static const char* STA_PASS = "sunisgood";           // Leave "" if open network, or enter your WiFi password
 
 // External Web Dashboard server (Where Next.js 'web' is running)
-// Current IP of your laptop: 10.199.101.247
-static const char* DASHBOARD_HOST = "10.199.101.247";
+// Current IP of your laptop on VoiDX: 10.38.17.190
+static const char* DASHBOARD_HOST = "10.38.17.190";
 static const int   DASHBOARD_PORT = 3000;
 static const char* DASHBOARD_PATH = "/api/esp32";
 #define POST_INTERVAL_MS 1500

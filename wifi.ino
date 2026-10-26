@@ -28,6 +28,8 @@ static const char* AP_PASS    = "12345678";
 
 IPAddress apIP(192, 168, 199, 1);
 IPAddress netMask(255, 255, 255, 0);
+IPAddress apLeaseStart(192, 168, 199, 2);
+IPAddress publicDns(8, 8, 8, 8);
 
 static String  dashboard_host = "";
 static int     dashboard_port = 3000;
@@ -57,7 +59,6 @@ unsigned long lastStmBroadcastMs = 0;
 WiFiUDP dnsServer;
 WiFiUDP dnsUpstream;
 const uint16_t DNS_PORT = 53;
-IPAddress publicDns(8, 8, 8, 8);
 
 WebServer server(80);
 
@@ -364,7 +365,8 @@ String buildStatusJson() {
 void sendCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.sendHeader("Access-Control-Allow-Headers", "*");
+  server.sendHeader("Access-Control-Allow-Private-Network", "true");
 }
 
 void handleStatus() {
@@ -467,9 +469,9 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  WiFi.softAPConfig(apIP, apIP, netMask);
+  WiFi.softAPConfig(apIP, apIP, netMask, apLeaseStart, publicDns);
   WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.printf("[AP] SSID: %s | GW: %s\n", AP_SSID, apIP.toString().c_str());
+  Serial.printf("[AP] SSID: %s | GW: %s | DNS: %s\n", AP_SSID, apIP.toString().c_str(), publicDns.toString().c_str());
 
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(promiscuousCallback);
@@ -534,6 +536,17 @@ void loop() {
   if (now - lastStmBroadcastMs >= 800) {
     lastStmBroadcastMs = now;
     broadcastToSTM32();
+  }
+
+
+  // Auto-reconnect to upstream WiFi if connection dropped
+  static unsigned long lastStaCheck = 0;
+  if (now - lastStaCheck > 5000) {
+    lastStaCheck = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[STA] Reconnecting to upstream WiFi...");
+      WiFi.reconnect();
+    }
   }
 
   if (now - last_push_ms >= PUSH_INTERVAL_MS) {

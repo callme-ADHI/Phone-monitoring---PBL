@@ -60,7 +60,7 @@ async function fetchEnrichedFromServer(): Promise<ESP32Telemetry | null> {
   try {
     const res = await fetch('/api/esp32', {
       cache: 'no-store',
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(6000),
     });
     if (res.ok) return await res.json();
   } catch {
@@ -125,6 +125,9 @@ export function usePhoneData(): PhoneData {
     const enriched = await fetchEnrichedFromServer();
     if (enriched) {
       enrichedRef.current = enriched;
+      if (enriched.esp32_ip) {
+        cachedEsp32Ip = enriched.esp32_ip;
+      }
       // If ESP32 is offline, reset devices and counts immediately!
       if (!enriched.is_alive) {
         setTelemetry({
@@ -147,7 +150,7 @@ export function usePhoneData(): PhoneData {
     fetchEnriched();
 
     const fastTimer = setInterval(fetchFast, POLL_INTERVAL_MS);
-    const enrichTimer = setInterval(fetchEnriched, ENRICH_INTERVAL_MS);
+    const enrichTimer = setInterval(fetchEnriched, 2000);
     const clockTimer = setInterval(() => setSecondsSince((s) => s + 1), 1000);
 
     return () => {

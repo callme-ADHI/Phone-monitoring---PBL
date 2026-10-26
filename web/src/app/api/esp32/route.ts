@@ -21,38 +21,53 @@ const emptyTelemetry: ESP32Telemetry = {
 
 let latestEsp32Data: ESP32Telemetry = { ...emptyTelemetry };
 
+// Non-blocking in-memory cache for Supabase schedules and students
+let cachedSchedules: any[] = [];
+let cachedStudents: any[] = [];
+let lastCacheSync = 0;
+let isSyncing = false;
+
+async function syncCache() {
+  if (isSyncing) return;
+  isSyncing = true;
+  try {
+    const [schedules, allStudents] = await Promise.all([
+      getClassSchedules(),
+      getStudents(),
+    ]);
+    if (schedules && schedules.length > 0) cachedSchedules = schedules;
+    if (allStudents && allStudents.length > 0) cachedStudents = allStudents;
+    lastCacheSync = Date.now();
+  } catch {
+    // non-fatal
+  } finally {
+    isSyncing = false;
+  }
+}
+
+// Kick off initial sync immediately
+syncCache();
+
+function getCachedData() {
+  const now = Date.now();
+  // Trigger background sync every 20 seconds, non-blocking
+  if (now - lastCacheSync > 20000) {
+    syncCache();
+  }
+  return { schedules: cachedSchedules, allStudents: cachedStudents };
+}
+
 async function fetchFromEsp32(): Promise<boolean> {
   const currentConfigIp = getTargetEsp32Ip();
 
-  const candidates = [
-    `http://${currentConfigIp}/api/status`,
-    'http://192.168.199.1/api/status',
-    'http://10.38.17.193/api/status',
-    'http://10.38.17.251/api/status',
-  ];
-
-  const seen = new Set<string>();
-  const urls: string[] = [];
-  for (const u of candidates) {
-    if (!seen.has(u)) {
-      seen.add(u);
-      urls.push(u);
-    }
-  }
-
-  for (const url of urls) {
-    try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(900),
-        cache: 'no-store',
-      });
-      if (!res.ok) continue;
-      const d = await res.json();
-
-      if (d.sta_ip && d.sta_ip !== '0.0.0.0') {
-        setTargetEsp32Ip(d.sta_ip);
-      }
-
+  // Fast-path: Try known configured IP first with a snappy 600ms timeout
+  try {
+    const fastRes = await fetch(`http://${currentConfigIp}/api/status`, {
+      signal: AbortSignal.timeout(600),
+      cache: 'no-store',
+    });
+    if (fastRes.ok) {
+      const d = await fastRes.json();
       latestEsp32Data = {
         connected_count: Number(d.connected_count) || 0,
         internet_allowed: d.internet_allowed !== undefined ? Boolean(d.internet_allowed) : true,
@@ -69,25 +84,71 @@ async function fetchFromEsp32(): Promise<boolean> {
         is_alive: true,
       };
       return true;
-    } catch {
-      // try next candidate
     }
+  } catch {
+    // Configured IP timed out or moved, proceed to sweep
   }
 
-  return false;
+  // Fallback: sweep known alternate candidates in parallel
+  const candidates = ['http://192.168.199.1/api/status', 'http://10.38.17.193/api/status', 'http://10.38.17.251/api/status'];
+  const d = await Promise.any(
+    candidates.map(async (url) => {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(1000),
+        cache: 'no-store',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+  ).catch(() => null);
+
+  if (!d) return false;
+
+  if (d.sta_ip && d.sta_ip !== '0.0.0.0') setTargetEsp32Ip(d.sta_ip);
+
+  latestEsp32Data = {
+    connected_count: Number(d.connected_count) || 0,
+    internet_allowed: d.internet_allowed !== undefined ? Boolean(d.internet_allowed) : true,
+    routing_status: d.routing_status === 'active' ? 'active' : 'unavailable',
+    ap_ssid: d.ap_ssid || 'PBL-MC',
+    ap_ip: d.ap_ip || '192.168.199.1',
+    sta_ssid: d.sta_ssid || 'VoiDX',
+    sta_status: d.sta_status || 'connected',
+    sta_ip: d.sta_ip || currentConfigIp,
+    channel: Number(d.channel) || 6,
+    uptime_secs: Number(d.uptime_secs) || 0,
+    devices: Array.isArray(d.devices) ? d.devices : [],
+    last_received_at: Date.now(),
+    is_alive: true,
+  };
+  return true;
 }
 
 async function enrichDevices(devices: any[]) {
-  const schedules = await getClassSchedules();
+  const { schedules, allStudents } = getCachedData();
   const activeSchedule = schedules.find((s) => s.in_session) || null;
-  const allStudents = await getStudents();
 
   const enrichedDevices: DeviceTelemetry[] = [];
   const connectedStudentIds = new Set<string>();
 
   for (const raw of devices) {
     const mac = (raw.mac || raw.id || '').trim().toUpperCase();
-    const match = mac ? await findStudentByMac(mac) : null;
+
+    // Look up student from in-memory cached list of all students & their registered devices
+    let matchedStudent: any = null;
+    let matchedDeviceName = 'Smartphone';
+    if (mac) {
+      for (const st of allStudents) {
+        const foundDev = (st.devices || []).find(
+          (dev: any) => (dev.mac_address || '').trim().toUpperCase() === mac
+        );
+        if (foundDev) {
+          matchedStudent = st;
+          matchedDeviceName = foundDev.device_name || 'Smartphone';
+          break;
+        }
+      }
+    }
 
     const isActive =
       (raw.up_bytes && raw.up_bytes > 2000) ||
@@ -96,14 +157,14 @@ async function enrichDevices(devices: any[]) {
 
     let compliance_status: DeviceTelemetry['compliance_status'] = 'off_hours';
     if (activeSchedule) {
-      if (match) {
+      if (matchedStudent) {
         compliance_status = isActive ? 'violation_active' : 'compliant_idle';
       } else {
         compliance_status = isActive ? 'unregistered_active' : 'compliant_idle';
       }
     }
 
-    if (match) connectedStudentIds.add(match.student.id);
+    if (matchedStudent) connectedStudentIds.add(matchedStudent.id);
 
     enrichedDevices.push({
       id: raw.id,
@@ -119,11 +180,11 @@ async function enrichDevices(devices: any[]) {
       last_domain: raw.last_domain || 'None',
       usage: raw.usage || (raw.idle_secs < 10 ? 'active' : 'idle'),
       idle_secs: Number(raw.idle_secs) || 0,
-      student_id: match?.student.id,
-      student_name: match?.student.name,
-      student_roll: match?.student.roll_no,
-      department: match?.student.department,
-      device_name: match?.device_name,
+      student_id: matchedStudent?.id,
+      student_name: matchedStudent?.name,
+      student_roll: matchedStudent?.roll_no,
+      department: matchedStudent?.department,
+      device_name: matchedDeviceName,
       compliance_status,
     });
   }
@@ -149,6 +210,7 @@ async function enrichDevices(devices: any[]) {
 }
 
 export async function GET() {
+  const tStart = Date.now();
   const now = Date.now();
   const staleMs = 3500;
   const isAliveFromPush =
@@ -156,16 +218,20 @@ export async function GET() {
 
   let isAlive = isAliveFromPush;
   if (!isAlive) {
+    const t0 = Date.now();
     isAlive = await fetchFromEsp32();
+    console.log('[PERF] fetchFromEsp32 took:', Date.now() - t0, 'ms');
   }
 
   // CRITICAL: If ESP32 is offline, zero out all counters and devices immediately!
   // Never show stale devices when disconnected.
   const activePayload = isAlive ? latestEsp32Data : { ...emptyTelemetry, is_alive: false };
 
+  const t1 = Date.now();
   const { enrichedDevices, activeSchedule, compliance_summary } = await enrichDevices(
     activePayload.devices || []
   );
+  console.log('[PERF] enrichDevices took:', Date.now() - t1, 'ms | Total GET:', Date.now() - tStart, 'ms');
 
   return NextResponse.json(
     {

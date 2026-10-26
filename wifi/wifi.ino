@@ -53,6 +53,9 @@ static const int   DASHBOARD_PORT = 3000;
 static const char* DASHBOARD_PATH = "/api/esp32";
 #define POST_INTERVAL_MS 1500
 
+static String target_dashboard_host = DASHBOARD_HOST;
+static int    target_dashboard_port = DASHBOARD_PORT;
+
 // ----------------------------------------------------------------------------
 // Device & DNS Tracking State
 // ----------------------------------------------------------------------------
@@ -381,7 +384,7 @@ static void send_telemetry_post(uint8_t count) {
   WiFiClient client;
   HTTPClient http;
 
-  String url = "http://" + String(DASHBOARD_HOST) + ":" + String(DASHBOARD_PORT) + String(DASHBOARD_PATH);
+  String url = "http://" + target_dashboard_host + ":" + String(target_dashboard_port) + String(DASHBOARD_PATH);
   if (!http.begin(client, url)) return;
 
   http.addHeader("Content-Type", "application/json");
@@ -400,16 +403,27 @@ static void send_telemetry_post(uint8_t count) {
     static uint32_t last_fail_log = 0;
     if (millis() - last_fail_log > 10000) {
       last_fail_log = millis();
-      Serial.printf("[TELEMETRY] Note: POST to %s refused (Client isolation active or laptop IP changed). Web polling mode is active.\n", DASHBOARD_HOST);
+      Serial.printf("[TELEMETRY] Note: POST to %s refused (Client isolation active or laptop IP changed). Web polling mode is active.\n", target_dashboard_host.c_str());
     }
   }
 
   http.end();
 }
 
-// ----------------------------------------------------------------------------
-// REST API Handlers on ESP32 Web Server
-// ----------------------------------------------------------------------------
+static void handle_api_config() {
+  if (server.hasArg("host")) {
+    target_dashboard_host = server.arg("host");
+    Serial.printf("[CONFIG] Target host dynamically updated to: %s\n", target_dashboard_host.c_str());
+  }
+  if (server.hasArg("port")) {
+    target_dashboard_port = server.arg("port").toInt();
+    Serial.printf("[CONFIG] Target port dynamically updated to: %d\n", target_dashboard_port);
+  }
+  String json = "{\"status\":\"ok\",\"host\":\"" + target_dashboard_host + "\",\"port\":" + String(target_dashboard_port) + "}";
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
 static void handle_api_status() {
   uint8_t count = sync_hardware_stations();
   String json = build_telemetry_json(count);
@@ -474,10 +488,12 @@ void setup() {
   server.on("/api/status", HTTP_GET, handle_api_status);
   server.on("/api/toggle", HTTP_POST, handle_api_toggle);
   server.on("/api/toggle", HTTP_GET, handle_api_toggle);
+  server.on("/api/config", HTTP_POST, handle_api_config);
+  server.on("/api/config", HTTP_GET, handle_api_config);
   server.begin();
 
   Serial.printf("[TELEMETRY] Target Web Dashboard: http://%s:%d%s\n",
-                DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_PATH);
+                target_dashboard_host.c_str(), target_dashboard_port, DASHBOARD_PATH);
   Serial.println(F("==================================================\n"));
 }
 

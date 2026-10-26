@@ -3,8 +3,8 @@ import { findStudentByMac, getStudents, getClassSchedules } from '@/lib/supabase
 import { DeviceTelemetry, ESP32Telemetry } from '@/types/occupancy';
 import { getTargetEsp32Ip, setTargetEsp32Ip } from '@/lib/esp32Config';
 
-// In-memory cache of last received telemetry
-let latestEsp32Data: ESP32Telemetry = {
+// Default empty telemetry when ESP32 is offline
+const emptyTelemetry: ESP32Telemetry = {
   connected_count: 0,
   routing_status: 'unavailable',
   ap_ssid: 'PBL-MC',
@@ -16,32 +16,39 @@ let latestEsp32Data: ESP32Telemetry = {
   uptime_secs: 0,
   devices: [],
   last_received_at: 0,
+  is_alive: false,
 };
+
+let latestEsp32Data: ESP32Telemetry = { ...emptyTelemetry };
 
 async function fetchFromEsp32(): Promise<boolean> {
   const currentConfigIp = getTargetEsp32Ip();
-  // Try: user-configured IP → gateway AP IP → last known STA IP
+
   const candidates = [
     `http://${currentConfigIp}/api/status`,
     'http://192.168.199.1/api/status',
-    'http://192.168.4.1/api/status',
+    'http://10.38.17.193/api/status',
+    'http://10.38.17.251/api/status',
   ];
 
-  // Deduplicate while preserving order
   const seen = new Set<string>();
   const urls: string[] = [];
-  for (const u of candidates) { if (!seen.has(u)) { seen.add(u); urls.push(u); } }
+  for (const u of candidates) {
+    if (!seen.has(u)) {
+      seen.add(u);
+      urls.push(u);
+    }
+  }
 
   for (const url of urls) {
     try {
       const res = await fetch(url, {
-        signal: AbortSignal.timeout(1500),
+        signal: AbortSignal.timeout(900),
         cache: 'no-store',
       });
       if (!res.ok) continue;
       const d = await res.json();
 
-      // Update config with discovered STA IP for future requests
       if (d.sta_ip && d.sta_ip !== '0.0.0.0') {
         setTargetEsp32Ip(d.sta_ip);
       }
@@ -59,12 +66,14 @@ async function fetchFromEsp32(): Promise<boolean> {
         uptime_secs: Number(d.uptime_secs) || 0,
         devices: Array.isArray(d.devices) ? d.devices : [],
         last_received_at: Date.now(),
+        is_alive: true,
       };
       return true;
     } catch {
-      // try next
+      // try next candidate
     }
   }
+
   return false;
 }
 
@@ -139,10 +148,9 @@ async function enrichDevices(devices: any[]) {
   };
 }
 
-// GET — poll ESP32 if no recent push data, then enrich and return
 export async function GET() {
   const now = Date.now();
-  const staleMs = 6000;
+  const staleMs = 3500;
   const isAliveFromPush =
     latestEsp32Data.last_received_at! > 0 && now - latestEsp32Data.last_received_at! < staleMs;
 
@@ -151,13 +159,17 @@ export async function GET() {
     isAlive = await fetchFromEsp32();
   }
 
+  // CRITICAL: If ESP32 is offline, zero out all counters and devices immediately!
+  // Never show stale devices when disconnected.
+  const activePayload = isAlive ? latestEsp32Data : { ...emptyTelemetry, is_alive: false };
+
   const { enrichedDevices, activeSchedule, compliance_summary } = await enrichDevices(
-    latestEsp32Data.devices || []
+    activePayload.devices || []
   );
 
   return NextResponse.json(
     {
-      ...latestEsp32Data,
+      ...activePayload,
       devices: enrichedDevices,
       is_alive: isAlive,
       active_schedule: activeSchedule,
@@ -173,12 +185,10 @@ export async function GET() {
   );
 }
 
-// POST — receive push telemetry from ESP32
 export async function POST(req: NextRequest) {
   try {
     const payload = await req.json();
 
-    // Auto-update target IP from incoming STA IP
     if (payload.sta_ip && payload.sta_ip !== '0.0.0.0') {
       setTargetEsp32Ip(payload.sta_ip);
     }
@@ -196,6 +206,7 @@ export async function POST(req: NextRequest) {
       uptime_secs: Number(payload.uptime_secs) || 0,
       devices: Array.isArray(payload.devices) ? payload.devices : [],
       last_received_at: Date.now(),
+      is_alive: true,
     };
 
     return NextResponse.json({

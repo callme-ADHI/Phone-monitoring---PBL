@@ -10,13 +10,25 @@ export interface PhoneData {
   refresh: () => Promise<void>;
 }
 
-// Fetch directly from ESP32 for raw live data (sub-second latency)
-// Falls back to Next.js proxy which also does Supabase enrichment
 const DIRECT_ESP32_TIMEOUT = 800;
 const POLL_INTERVAL_MS = 1200;
-const ENRICH_INTERVAL_MS = 5000; // Supabase enrichment less frequently
+const ENRICH_INTERVAL_MS = 3000;
 
-let cachedEsp32Ip = '10.38.17.251';
+let cachedEsp32Ip = '10.38.17.193';
+
+const emptyTelemetry: ESP32Telemetry = {
+  connected_count: 0,
+  routing_status: 'unavailable',
+  ap_ssid: 'PBL-MC',
+  ap_ip: '192.168.199.1',
+  sta_ssid: 'VoiDX',
+  sta_status: 'disconnected',
+  sta_ip: '0.0.0.0',
+  channel: 6,
+  uptime_secs: 0,
+  devices: [],
+  is_alive: false,
+};
 
 async function fetchDirectFromEsp32(): Promise<any | null> {
   const urls = [
@@ -48,7 +60,7 @@ async function fetchEnrichedFromServer(): Promise<ESP32Telemetry | null> {
   try {
     const res = await fetch('/api/esp32', {
       cache: 'no-store',
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(3000),
     });
     if (res.ok) return await res.json();
   } catch {
@@ -58,29 +70,15 @@ async function fetchEnrichedFromServer(): Promise<ESP32Telemetry | null> {
 }
 
 export function usePhoneData(): PhoneData {
-  const [telemetry, setTelemetry] = useState<ESP32Telemetry>({
-    connected_count: 0,
-    routing_status: 'unavailable',
-    ap_ssid: 'PBL-MC',
-    ap_ip: '192.168.199.1',
-    sta_ssid: 'VoiDX',
-    sta_status: 'disconnected',
-    sta_ip: '0.0.0.0',
-    channel: 6,
-    uptime_secs: 0,
-    devices: [],
-    is_alive: false,
-  });
+  const [telemetry, setTelemetry] = useState<ESP32Telemetry>(emptyTelemetry);
   const [secondsSince, setSecondsSince] = useState(0);
   const enrichedRef = useRef<Partial<ESP32Telemetry>>({});
 
-  // Fast path: fetch raw from ESP32 and merge with last enrichment
   const fetchFast = useCallback(async () => {
     const raw = await fetchDirectFromEsp32();
     if (raw) {
       setSecondsSince(0);
       setTelemetry((prev) => {
-        // Merge raw traffic data with enriched student/compliance data from last slow fetch
         const enrichedDevices = enrichedRef.current.devices || [];
         const mergedDevices = (raw.devices || []).map((rawDev: any) => {
           const enriched = enrichedDevices.find(
@@ -89,7 +87,6 @@ export function usePhoneData(): PhoneData {
           return enriched
             ? {
                 ...enriched,
-                // Always use fresh traffic values from ESP32
                 up_bytes: rawDev.up_bytes,
                 down_bytes: rawDev.down_bytes,
                 up_pkts: rawDev.up_pkts,
@@ -124,32 +121,33 @@ export function usePhoneData(): PhoneData {
     }
   }, []);
 
-  // Slow path: full enrichment (student names, compliance, schedule)
   const fetchEnriched = useCallback(async () => {
     const enriched = await fetchEnrichedFromServer();
     if (enriched) {
       enrichedRef.current = enriched;
-      setTelemetry(enriched);
-      setSecondsSince(0);
+      // If ESP32 is offline, reset devices and counts immediately!
+      if (!enriched.is_alive) {
+        setTelemetry({
+          ...emptyTelemetry,
+          active_schedule: enriched.active_schedule,
+          is_alive: false,
+        });
+      } else {
+        setTelemetry(enriched);
+        setSecondsSince(0);
+      }
     }
   }, []);
 
-  // Combined refresh (used by manual refresh button)
   const refresh = useCallback(async () => {
     await fetchEnriched();
   }, [fetchEnriched]);
 
   useEffect(() => {
-    // Initial enriched fetch
     fetchEnriched();
 
-    // Fast raw poll every 1.2s
     const fastTimer = setInterval(fetchFast, POLL_INTERVAL_MS);
-
-    // Enriched (with Supabase student names) every 5s
     const enrichTimer = setInterval(fetchEnriched, ENRICH_INTERVAL_MS);
-
-    // Clock
     const clockTimer = setInterval(() => setSecondsSince((s) => s + 1), 1000);
 
     return () => {
